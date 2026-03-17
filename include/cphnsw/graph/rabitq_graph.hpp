@@ -1,28 +1,21 @@
 #pragma once
 
-#include "../core/types.hpp"
-#include "../core/codes.hpp"
-#include "../core/memory.hpp"
-#include "../core/constants.hpp"
-#include "../distance/fastscan_layout.hpp"
-#include "neighbor_selection.hpp"
+#include "../core/core.hpp"
+#include "../distance/fastscan_kernel.hpp"
 #include <vector>
 #include <array>
 #include <queue>
 #include <cstring>
-#include <type_traits>
-#include <limits>
+
+#include <omp.h>
 
 namespace cphnsw {
 
 
 template <size_t D, size_t R, size_t BitWidth = 1>
 struct alignas(64) VertexSearchData {
-    using CodeType = std::conditional_t<BitWidth == 1,
-        RaBitQCode<D>, NbitRaBitQCode<D, BitWidth>>;
-    using NeighborBlockType = std::conditional_t<BitWidth == 1,
-        FastScanNeighborBlock<D, R, 32>,
-        NbitFastScanNeighborBlock<D, R, BitWidth, 32>>;
+    using CodeType = NbitRaBitQCode<D, BitWidth>;
+    using NeighborBlockType = NbitFastScanNeighborBlock<D, R, BitWidth>;
 
     CodeType code;
     NeighborBlockType neighbors;
@@ -31,8 +24,6 @@ struct alignas(64) VertexSearchData {
 template <size_t D, size_t R = 32, size_t BitWidth = 1>
 class RaBitQGraph {
 public:
-    static_assert(R % 32 == 0, "R must be a multiple of 32 for AVX2 FastScan");
-
     using SearchDataType = VertexSearchData<D, R, BitWidth>;
     using CodeType = typename SearchDataType::CodeType;
     using NeighborBlockType = typename SearchDataType::NeighborBlockType;
@@ -48,27 +39,10 @@ public:
         norm_sq_.reserve(capacity);
     }
 
-    RaBitQGraph(RaBitQGraph&& other) noexcept
-        : dim_(other.dim_)
-        , search_data_(std::move(other.search_data_))
-        , raw_vectors_(std::move(other.raw_vectors_))
-        , norm_sq_(std::move(other.norm_sq_))
-        , entry_point_(other.entry_point_) {
-    }
-
-    RaBitQGraph& operator=(RaBitQGraph&& other) noexcept {
-        if (this != &other) {
-            dim_ = other.dim_;
-            search_data_ = std::move(other.search_data_);
-            raw_vectors_ = std::move(other.raw_vectors_);
-            norm_sq_ = std::move(other.norm_sq_);
-            entry_point_ = other.entry_point_;
-        }
-        return *this;
-    }
-
     RaBitQGraph(const RaBitQGraph&) = delete;
     RaBitQGraph& operator=(const RaBitQGraph&) = delete;
+    RaBitQGraph(RaBitQGraph&&) = default;
+    RaBitQGraph& operator=(RaBitQGraph&&) = default;
 
     NodeId add_node(const CodeType& code, const float* vec) {
         NodeId id = static_cast<NodeId>(search_data_.size());
@@ -81,9 +55,8 @@ public:
             std::memset(raw_vectors_.back().data() + dim_, 0, (D - dim_) * sizeof(float));
         }
 
-        float nsq = 0.0f;
         const float* stored = raw_vectors_.back().data();
-        for (size_t j = 0; j < dim_; ++j) nsq += stored[j] * stored[j];
+        float nsq = dot_product_simd<D>(stored, stored);
         norm_sq_.push_back(nsq);
 
         if (entry_point_ == INVALID_NODE) entry_point_ = id;
@@ -98,13 +71,10 @@ public:
     }
 
     size_t size() const { return search_data_.size(); }
-    bool empty() const { return search_data_.empty(); }
-
     NodeId entry_point() const { return entry_point_; }
 
     void set_entry_point(NodeId id) { entry_point_ = id; }
 
-    // Serialization accessors
     const std::vector<SearchDataType, AlignedAllocator<SearchDataType>>& get_search_data() const {
         return search_data_;
     }
@@ -133,8 +103,6 @@ public:
 
     float get_norm_sq(NodeId id) const { return norm_sq_[id]; }
 
-    bool is_alive(NodeId id) const { return id < search_data_.size(); }
-
     void prefetch_norm(NodeId id) const {
         prefetch_t<1>(&norm_sq_[id]);
     }
@@ -148,8 +116,8 @@ public:
     }
 
     static constexpr size_t PREFETCH_LINES =
-        (sizeof(SearchDataType) / CACHE_LINE_SIZE < constants::kPrefetchLineCap)
-            ? (sizeof(SearchDataType) / CACHE_LINE_SIZE) : constants::kPrefetchLineCap;
+        (sizeof(SearchDataType) / CACHE_LINE_SIZE < size_t(16))
+            ? (sizeof(SearchDataType) / CACHE_LINE_SIZE) : size_t(16);
 
     void prefetch_vertex(NodeId id) const {
         const char* base = reinterpret_cast<const char*>(&search_data_[id]);
@@ -161,7 +129,7 @@ public:
     void prefetch_vector(NodeId id) const {
         const char* base = reinterpret_cast<const char*>(raw_vectors_[id].data());
         constexpr size_t VEC_LINES = (D * sizeof(float) + CACHE_LINE_SIZE - 1) / CACHE_LINE_SIZE;
-        constexpr size_t MAX_VEC_LINES = (VEC_LINES < constants::kMaxVecPrefetchLines) ? VEC_LINES : constants::kMaxVecPrefetchLines;
+        constexpr size_t MAX_VEC_LINES = (VEC_LINES < size_t(4)) ? VEC_LINES : size_t(4);
         for (size_t line = 0; line < MAX_VEC_LINES; ++line) {
             prefetch_t<1>(base + line * CACHE_LINE_SIZE);
         }
@@ -169,7 +137,6 @@ public:
 
     std::vector<double> compute_centroid() const {
         size_t n = raw_vectors_.size();
-        if (n == 0) return std::vector<double>(dim_, 0.0);
         std::vector<double> centroid(dim_, 0.0);
         for (size_t i = 0; i < n; ++i) {
             const float* v = raw_vectors_[i].data();
@@ -182,33 +149,9 @@ public:
         return centroid;
     }
 
-    NodeId find_nearest_to_centroid(const std::vector<double>& centroid) const {
-        size_t n = raw_vectors_.size();
-        NodeId best = 0;
-        double best_dist = std::numeric_limits<double>::max();
-        for (size_t i = 0; i < n; ++i) {
-            const float* v = raw_vectors_[i].data();
-            double dist = 0.0;
-            for (size_t j = 0; j < dim_; ++j) {
-                double d = v[j] - centroid[j];
-                dist += d * d;
-            }
-            if (dist < best_dist) {
-                best_dist = dist;
-                best = static_cast<NodeId>(i);
-            }
-        }
-        return best;
-    }
-
-    struct Permutation {
-        std::vector<NodeId> old_to_new;
-    };
-
-    Permutation reorder_bfs(NodeId entry) {
+    std::vector<NodeId> reorder_bfs(NodeId entry) {
         size_t n = search_data_.size();
-        Permutation perm;
-        perm.old_to_new.resize(n, INVALID_NODE);
+        std::vector<NodeId> perm(n, INVALID_NODE);
         std::vector<NodeId> new_to_old(n);
 
         std::vector<bool> visited(n, false);
@@ -216,20 +159,20 @@ public:
         NodeId next_new_id = 0;
 
         auto run_bfs = [&](NodeId start) {
-            if (start >= n || visited[start]) return;
+            if (visited[start]) return;
             bfs_queue.push(start);
             visited[start] = true;
             while (!bfs_queue.empty()) {
                 NodeId curr = bfs_queue.front();
                 bfs_queue.pop();
-                perm.old_to_new[curr] = next_new_id;
+                perm[curr] = next_new_id;
                 new_to_old[next_new_id] = curr;
                 next_new_id++;
 
                 const auto& nb = search_data_[curr].neighbors;
                 for (size_t i = 0; i < nb.size(); ++i) {
                     NodeId neighbor = nb.neighbor_ids[i];
-                    if (neighbor != INVALID_NODE && neighbor < n && !visited[neighbor]) {
+                    if (neighbor != INVALID_NODE && !visited[neighbor]) {
                         visited[neighbor] = true;
                         bfs_queue.push(neighbor);
                     }
@@ -259,8 +202,8 @@ public:
             auto& nb = new_search[i].neighbors;
             for (size_t j = 0; j < R; ++j) {
                 NodeId old_nid = nb.neighbor_ids[j];
-                if (old_nid != INVALID_NODE && old_nid < n) {
-                    nb.neighbor_ids[j] = perm.old_to_new[old_nid];
+                if (old_nid != INVALID_NODE) {
+                    nb.neighbor_ids[j] = perm[old_nid];
                 }
             }
         }
@@ -269,17 +212,82 @@ public:
         raw_vectors_ = std::move(new_vectors);
         norm_sq_ = std::move(new_norms);
 
-        NodeId old_ep = entry_point_;
-        if (old_ep != INVALID_NODE && old_ep < n) {
-            entry_point_ = perm.old_to_new[old_ep];
-        }
+        entry_point_ = perm[entry_point_];
 
         return perm;
     }
 
+    NodeId find_nearest_to_centroid(const std::vector<double>& centroid) const {
+        size_t n = raw_vectors_.size();
+        NodeId best = INVALID_NODE;
+        double best_dist = std::numeric_limits<double>::max();
+
+        // Convert centroid to float for SIMD-friendly comparison
+        alignas(64) float centroid_f[D];
+        for (size_t j = 0; j < dim_; ++j) centroid_f[j] = static_cast<float>(centroid[j]);
+        for (size_t j = dim_; j < D; ++j) centroid_f[j] = 0.0f;
+
+        #pragma omp parallel
+        {
+            NodeId local_best = INVALID_NODE;
+            float local_best_dist = std::numeric_limits<float>::max();
+
+            #pragma omp for schedule(static) nowait
+            for (size_t i = 0; i < n; ++i) {
+                float dist = l2_distance_simd<D>(raw_vectors_[i].data(), centroid_f);
+                if (dist < local_best_dist) {
+                    local_best_dist = dist;
+                    local_best = static_cast<NodeId>(i);
+                }
+            }
+
+            #pragma omp critical
+            {
+                if (local_best_dist < best_dist) {
+                    best_dist = local_best_dist;
+                    best = local_best;
+                }
+            }
+        }
+        return best;
+    }
+
     NodeId find_hub_entry(const std::vector<double>& centroid) const {
-        if (empty()) return INVALID_NODE;
-        return find_hub_entry_impl(centroid);
+        size_t n = raw_vectors_.size();
+
+        struct CentroidDist {
+            NodeId id;
+            float dist;
+            bool operator<(const CentroidDist& o) const { return dist < o.dist; }
+        };
+
+        // Convert centroid to float for SIMD
+        alignas(64) float centroid_f[D];
+        for (size_t j = 0; j < dim_; ++j) centroid_f[j] = static_cast<float>(centroid[j]);
+        for (size_t j = dim_; j < D; ++j) centroid_f[j] = 0.0f;
+
+        size_t top_k = std::max<size_t>(1, static_cast<size_t>(std::sqrt(static_cast<double>(n))));
+        std::vector<CentroidDist> dists(n);
+
+        #pragma omp parallel for schedule(static)
+        for (size_t i = 0; i < n; ++i) {
+            dists[i] = {static_cast<NodeId>(i),
+                        l2_distance_simd<D>(raw_vectors_[i].data(), centroid_f)};
+        }
+
+        std::partial_sort(dists.begin(), dists.begin() + top_k, dists.end());
+
+        NodeId best = dists[0].id;
+        size_t best_degree = search_data_[best].neighbors.size();
+        for (size_t i = 1; i < top_k; ++i) {
+            NodeId cand = dists[i].id;
+            size_t deg = search_data_[cand].neighbors.size();
+            if (deg > best_degree) {
+                best_degree = deg;
+                best = cand;
+            }
+        }
+        return best;
     }
 
 private:
@@ -288,44 +296,6 @@ private:
     std::vector<RawVector> raw_vectors_;
     AlignedVector<float> norm_sq_;
     NodeId entry_point_ = INVALID_NODE;
-
-    NodeId find_hub_entry_impl(const std::vector<double>& centroid) const {
-        size_t n = raw_vectors_.size();
-
-        struct CentroidDist {
-            NodeId id;
-            double dist;
-            bool operator<(const CentroidDist& o) const { return dist < o.dist; }
-        };
-
-        size_t top_k = std::max<size_t>(1, static_cast<size_t>(std::sqrt(static_cast<double>(n))));
-        std::vector<CentroidDist> dists(n);
-        for (size_t i = 0; i < n; ++i) {
-            const float* v = raw_vectors_[i].data();
-            double dist = 0.0;
-            for (size_t j = 0; j < dim_; ++j) {
-                double d = v[j] - centroid[j];
-                dist += d * d;
-            }
-            dists[i] = {static_cast<NodeId>(i), dist};
-        }
-
-        if (top_k < n) {
-            std::partial_sort(dists.begin(), dists.begin() + top_k, dists.end());
-        }
-
-        NodeId best = INVALID_NODE;
-        size_t best_degree = 0;
-        for (size_t i = 0; i < top_k && i < n; ++i) {
-            NodeId cand = dists[i].id;
-            size_t deg = search_data_[cand].neighbors.size();
-            if (best == INVALID_NODE || deg > best_degree) {
-                best_degree = deg;
-                best = cand;
-            }
-        }
-        return best;
-    }
 };
 
 }

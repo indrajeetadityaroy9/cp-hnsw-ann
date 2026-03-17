@@ -1,221 +1,186 @@
 #pragma once
 
-#include "../core/codes.hpp"
-#include "../core/constants.hpp"
-#include "fastscan_layout.hpp"
-#include <cstdint>
+#include "../core/core.hpp"
+#include <climits>
+#include <limits>
 #include <cmath>
 #include <algorithm>
-#include <cstring>
 
 #include <immintrin.h>
 
 namespace cphnsw {
 
+template <size_t D>
+struct FastScanCodeBlock {
+    static constexpr size_t NUM_SUB_SEGMENTS = num_sub_segments<D>;
+    static constexpr size_t NUM_SUB_PAIRS = (NUM_SUB_SEGMENTS + 1) / 2;
+
+    alignas(64) uint8_t packed[NUM_SUB_PAIRS][32];
+
+    void store(size_t idx, const BinaryCodeStorage<D>& code) {
+        for (size_t sp = 0; sp < NUM_SUB_PAIRS; ++sp) {
+            uint8_t lo = extract_sub_segment(code, 2 * sp);
+            uint8_t hi = (2 * sp + 1 < NUM_SUB_SEGMENTS)
+                         ? extract_sub_segment(code, 2 * sp + 1) : 0;
+            packed[sp][idx] = static_cast<uint8_t>((hi << 4) | lo);
+        }
+    }
+
+private:
+    static uint8_t extract_sub_segment(const BinaryCodeStorage<D>& code, size_t seg_idx) {
+        size_t bit_start = seg_idx * 4;
+        uint8_t result = 0;
+        for (size_t b = 0; b < 4 && (bit_start + b) < D; ++b) {
+            if (code.get_bit(bit_start + b)) result |= (1 << b);
+        }
+        return result;
+    }
+};
+
+template <size_t D, size_t BitWidth>
+struct NbitFastScanCodeBlock {
+    FastScanCodeBlock<D> planes[BitWidth];
+
+    void store(size_t idx, const NbitCodeStorage<D, BitWidth>& code) {
+        for (size_t b = 0; b < BitWidth; ++b) {
+            BinaryCodeStorage<D> plane_binary;
+            std::memcpy(plane_binary.signs, code.planes[b],
+                        BinaryCodeStorage<D>::NUM_WORDS * sizeof(uint64_t));
+            planes[b].store(idx, plane_binary);
+        }
+    }
+};
+
+template <size_t D, size_t R, size_t BitWidth>
+struct NbitFastScanNeighborBlock {
+    static constexpr size_t NUM_BATCHES = R / 32;
+
+    NbitFastScanCodeBlock<D, BitWidth> code_blocks[NUM_BATCHES];
+    alignas(64) float nop[R];
+    alignas(64) float ip_qo[R];
+    alignas(64) float ip_cp[R];
+    alignas(64) uint16_t popcounts[R];
+    alignas(64) uint16_t weighted_popcounts[R];
+    alignas(64) uint32_t neighbor_ids[R];
+    uint32_t count;
+
+    NbitFastScanNeighborBlock() : count(0) {
+        std::memset(nop, 0, sizeof(nop));
+        std::memset(ip_qo, 0, sizeof(ip_qo));
+        std::memset(ip_cp, 0, sizeof(ip_cp));
+        std::memset(neighbor_ids, 0xFF, sizeof(neighbor_ids));
+        std::memset(popcounts, 0, sizeof(popcounts));
+        std::memset(weighted_popcounts, 0, sizeof(weighted_popcounts));
+    }
+
+    void set_neighbor(size_t slot, uint32_t id,
+                      const NbitCodeStorage<D, BitWidth>& code,
+                      const VertexAuxData& aux_data) {
+        neighbor_ids[slot] = id;
+        code_blocks[slot / 32].store(slot % 32, code);
+        nop[slot] = aux_data.nop;
+        ip_qo[slot] = aux_data.ip_qo;
+        ip_cp[slot] = aux_data.ip_cp;
+        popcounts[slot] = static_cast<uint16_t>(code.msb_popcount());
+        weighted_popcounts[slot] = static_cast<uint16_t>(code.weighted_popcount());
+        if (slot >= count) count = static_cast<uint32_t>(slot + 1);
+    }
+
+    size_t size() const { return count; }
+};
+
 namespace fastscan {
+
+constexpr size_t BATCH_SIZE = 256 / CHAR_BIT;
+
+inline __m256 rcp_nr(__m256 d) {
+    __m256 x = _mm256_rcp_ps(d);
+    return _mm256_mul_ps(x, _mm256_fnmadd_ps(d, x, _mm256_set1_ps(2.0f)));
+}
+
+#ifdef __AVX512F__
+inline __m512 rcp_nr(__m512 d) {
+    __m512 x = _mm512_rcp14_ps(d);
+    return _mm512_mul_ps(x, _mm512_fnmadd_ps(d, x, _mm512_set1_ps(2.0f)));
+}
+#endif
 
 template <size_t D>
 inline void compute_inner_products(
     const uint8_t lut[][16],
-    const FastScanCodeBlock<D, 32>& block,
-    uint32_t* out)
+    const FastScanCodeBlock<D>& block,
+    uint32_t* __restrict__ out)
 {
-    constexpr size_t NUM_SUB_PAIRS = FastScanCodeBlock<D, 32>::NUM_SUB_PAIRS;
-    constexpr size_t NUM_SUB_SEGMENTS = FastScanCodeBlock<D, 32>::NUM_SUB_SEGMENTS;
+    constexpr size_t NUM_SUB_PAIRS = FastScanCodeBlock<D>::NUM_SUB_PAIRS;
+    constexpr size_t NUM_SUB_SEGMENTS = FastScanCodeBlock<D>::NUM_SUB_SEGMENTS;
+    constexpr size_t FLUSH = std::numeric_limits<uint8_t>::max()
+        / (2 * (CHAR_BIT / 2) * ((1 << (CHAR_BIT / 2)) - 1));
 
     const __m256i low_mask = _mm256_set1_epi8(0x0F);
-
     __m256i acc_lo = _mm256_setzero_si256();
     __m256i acc_hi = _mm256_setzero_si256();
-
     __m256i tmp_acc = _mm256_setzero_si256();
     size_t pairs_since_flush = 0;
 
     for (size_t sp = 0; sp < NUM_SUB_PAIRS; ++sp) {
-        size_t seg_lo = 2 * sp;
-        size_t seg_hi = 2 * sp + 1;
-
-        __m256i codes = _mm256_loadu_si256(
+        __m256i codes = _mm256_load_si256(
             reinterpret_cast<const __m256i*>(block.packed[sp]));
 
         __m256i lo_nibbles = _mm256_and_si256(codes, low_mask);
         __m256i hi_nibbles = _mm256_and_si256(_mm256_srli_epi16(codes, 4), low_mask);
 
-        __m128i lut_lo_128 = _mm_loadu_si128(
-            reinterpret_cast<const __m128i*>(lut[seg_lo]));
-        __m256i lut_lo = _mm256_broadcastsi128_si256(lut_lo_128);
+        __m256i lut_lo = _mm256_broadcastsi128_si256(
+            _mm_loadu_si128(reinterpret_cast<const __m128i*>(lut[2 * sp])));
+        tmp_acc = _mm256_add_epi8(tmp_acc, _mm256_shuffle_epi8(lut_lo, lo_nibbles));
 
-        __m256i result_lo = _mm256_shuffle_epi8(lut_lo, lo_nibbles);
-        tmp_acc = _mm256_add_epi8(tmp_acc, result_lo);
-
-        if (seg_hi < NUM_SUB_SEGMENTS) {
-            __m128i lut_hi_128 = _mm_loadu_si128(
-                reinterpret_cast<const __m128i*>(lut[seg_hi]));
-            __m256i lut_hi = _mm256_broadcastsi128_si256(lut_hi_128);
-
-            __m256i result_hi = _mm256_shuffle_epi8(lut_hi, hi_nibbles);
-            tmp_acc = _mm256_add_epi8(tmp_acc, result_hi);
+        if (2 * sp + 1 < NUM_SUB_SEGMENTS) {
+            __m256i lut_hi = _mm256_broadcastsi128_si256(
+                _mm_loadu_si128(reinterpret_cast<const __m128i*>(lut[2 * sp + 1])));
+            tmp_acc = _mm256_add_epi8(tmp_acc, _mm256_shuffle_epi8(lut_hi, hi_nibbles));
         }
 
-        pairs_since_flush++;
-
-        if (pairs_since_flush >= constants::kFlushInterval || sp == NUM_SUB_PAIRS - 1) {
-            __m256i widened_lo = _mm256_cvtepu8_epi16(
-                _mm256_castsi256_si128(tmp_acc));
-            acc_lo = _mm256_add_epi16(acc_lo, widened_lo);
-
-            __m256i widened_hi = _mm256_cvtepu8_epi16(
-                _mm256_extracti128_si256(tmp_acc, 1));
-            acc_hi = _mm256_add_epi16(acc_hi, widened_hi);
-
+        if (++pairs_since_flush >= FLUSH || sp == NUM_SUB_PAIRS - 1) {
+            acc_lo = _mm256_add_epi16(acc_lo,
+                _mm256_cvtepu8_epi16(_mm256_castsi256_si128(tmp_acc)));
+            acc_hi = _mm256_add_epi16(acc_hi,
+                _mm256_cvtepu8_epi16(_mm256_extracti128_si256(tmp_acc, 1)));
             tmp_acc = _mm256_setzero_si256();
             pairs_since_flush = 0;
         }
     }
 
-    __m256i r0 = _mm256_cvtepu16_epi32(_mm256_castsi256_si128(acc_lo));
-    _mm256_storeu_si256(reinterpret_cast<__m256i*>(out), r0);
-
-    __m256i r1 = _mm256_cvtepu16_epi32(_mm256_extracti128_si256(acc_lo, 1));
-    _mm256_storeu_si256(reinterpret_cast<__m256i*>(out + 8), r1);
-
-    __m256i r2 = _mm256_cvtepu16_epi32(_mm256_castsi256_si128(acc_hi));
-    _mm256_storeu_si256(reinterpret_cast<__m256i*>(out + 16), r2);
-
-    __m256i r3 = _mm256_cvtepu16_epi32(_mm256_extracti128_si256(acc_hi, 1));
-    _mm256_storeu_si256(reinterpret_cast<__m256i*>(out + 24), r3);
+    _mm256_store_si256(reinterpret_cast<__m256i*>(out),
+        _mm256_cvtepu16_epi32(_mm256_castsi256_si128(acc_lo)));
+    _mm256_store_si256(reinterpret_cast<__m256i*>(out + 8),
+        _mm256_cvtepu16_epi32(_mm256_extracti128_si256(acc_lo, 1)));
+    _mm256_store_si256(reinterpret_cast<__m256i*>(out + 16),
+        _mm256_cvtepu16_epi32(_mm256_castsi256_si128(acc_hi)));
+    _mm256_store_si256(reinterpret_cast<__m256i*>(out + 24),
+        _mm256_cvtepu16_epi32(_mm256_extracti128_si256(acc_hi, 1)));
 }
-
-template <size_t D>
-inline void convert_to_distances_with_bounds(
-    const RaBitQQuery<D>& query,
-    const uint32_t* fastscan_sums,
-    const float* nop_arr,
-    const float* ip_qo_p_arr,
-    const float* ip_cp_arr,
-    const uint16_t* popcounts,
-    size_t count,
-    float* out_dist,
-    float* out_lower,
-    float dist_qp_sq)
-{
-    float A = query.coeff_fastscan;
-    float B = query.coeff_popcount;
-    float C = query.coeff_constant;
-    float affine_a = query.affine_a;
-    float affine_b = query.affine_b;
-    float ip_qo_floor = query.ip_qo_floor;
-    float dot_slack = query.dot_slack;
-    float sqrt_dqp = std::sqrt(dist_qp_sq);
-
-
-    if (dist_qp_sq < constants::eps::kSmall) {
-        for (size_t i = 0; i < count; ++i) {
-            float nop = nop_arr[i];
-            out_dist[i] = nop * nop + dist_qp_sq;
-            out_lower[i] = 0.0f;
-        }
-        return;
-    }
-
-    size_t i = 0;
-
-    const __m256 vA = _mm256_set1_ps(A);
-    const __m256 vB = _mm256_set1_ps(B);
-    const __m256 vC = _mm256_set1_ps(C);
-    const __m256 vaffine_a = _mm256_set1_ps(affine_a);
-    const __m256 vaffine_b = _mm256_set1_ps(affine_b);
-    const __m256 vfloor = _mm256_set1_ps(ip_qo_floor);
-    const __m256 vdot_slack = _mm256_set1_ps(dot_slack);
-    const __m256 vsqrt_dqp = _mm256_set1_ps(sqrt_dqp);
-    const __m256 vdist_qp_sq = _mm256_set1_ps(dist_qp_sq);
-    const __m256 vip_thresh = _mm256_set1_ps(constants::eps::kMedium);
-    const __m256 vzero = _mm256_setzero_ps();
-    const __m256 vone = _mm256_set1_ps(1.0f);
-    const __m256 vneg_one = _mm256_set1_ps(-1.0f);
-    const __m256 vtwo = _mm256_set1_ps(2.0f);
-
-    for (; i + 8 <= count; i += 8) {
-        __m256 fs = _mm256_cvtepi32_ps(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(fastscan_sums + i)));
-        __m128i pc16 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(popcounts + i));
-        __m256 vpc = _mm256_cvtepi32_ps(_mm256_cvtepu16_epi32(pc16));
-        __m256 ip_approx = _mm256_fmadd_ps(vA, fs, _mm256_fmadd_ps(vB, vpc, vC));
-
-        __m256 ip_qo_p = _mm256_loadu_ps(ip_qo_p_arr + i);
-        __m256 ip_cp = _mm256_loadu_ps(ip_cp_arr + i);
-        __m256 nop = _mm256_loadu_ps(nop_arr + i);
-
-        ip_qo_p = _mm256_max_ps(ip_qo_p, vfloor);
-
-        __m256 ip_corrected = _mm256_sub_ps(ip_approx, ip_cp);
-        __m256 mask_good = _mm256_cmp_ps(ip_qo_p, vip_thresh, _CMP_GT_OQ);
-        __m256 ip_est = _mm256_and_ps(mask_good, _mm256_div_ps(ip_corrected, ip_qo_p));
-
-        ip_est = _mm256_fmadd_ps(vaffine_a, ip_est, vaffine_b);
-
-        __m256 dist = _mm256_fmadd_ps(nop, nop, vdist_qp_sq);
-        dist = _mm256_fnmadd_ps(_mm256_mul_ps(vtwo, nop), ip_est, dist);
-        dist = _mm256_max_ps(dist, vzero);
-
-        __m256 cos_upper = _mm256_div_ps(
-            _mm256_add_ps(ip_est, vdot_slack),
-            _mm256_max_ps(vsqrt_dqp, vip_thresh));
-        cos_upper = _mm256_min_ps(_mm256_max_ps(cos_upper, vneg_one), vone);
-
-        __m256 lower = _mm256_fmadd_ps(nop, nop, vdist_qp_sq);
-        lower = _mm256_fnmadd_ps(_mm256_mul_ps(_mm256_mul_ps(vtwo, nop), vsqrt_dqp), cos_upper, lower);
-        lower = _mm256_max_ps(lower, vzero);
-
-        lower = _mm256_and_ps(mask_good, lower);
-
-        _mm256_storeu_ps(out_dist + i, dist);
-        _mm256_storeu_ps(out_lower + i, lower);
-    }
-
-    // Scalar tail for remainder when count is not a multiple of 8
-    for (; i < count; ++i) {
-        float ip_approx = A * static_cast<float>(fastscan_sums[i])
-                        + B * static_cast<float>(popcounts[i]) + C;
-        float ip_qo_p = std::max(ip_qo_p_arr[i], ip_qo_floor);
-        float ip_corrected = ip_approx - ip_cp_arr[i];
-        float ip_est = (ip_qo_p > constants::eps::kMedium) ? ip_corrected / ip_qo_p : 0.0f;
-        ip_est = affine_a * ip_est + affine_b;
-        float nop = nop_arr[i];
-        out_dist[i] = std::max(nop * nop + dist_qp_sq - 2.0f * nop * ip_est, 0.0f);
-
-        if (ip_qo_p <= constants::eps::kMedium) {
-            out_lower[i] = 0.0f;
-            continue;
-        }
-
-        float cos_upper = std::clamp((ip_est + dot_slack) / sqrt_dqp, -1.0f, 1.0f);
-        out_lower[i] = std::max(nop * nop + dist_qp_sq - 2.0f * nop * sqrt_dqp * cos_upper, 0.0f);
-    }
-}
-
 
 template <size_t D, size_t BitWidth>
 inline void compute_nbit_inner_products(
     const uint8_t lut[][16],
-    const NbitFastScanCodeBlock<D, BitWidth, 32>& block,
-    uint32_t* out_nbit,
-    uint32_t* out_msb)
+    const NbitFastScanCodeBlock<D, BitWidth>& block,
+    uint32_t* __restrict__ out_nbit,
+    uint32_t* __restrict__ out_msb)
 {
     std::memset(out_nbit, 0, 32 * sizeof(uint32_t));
     alignas(64) uint32_t plane_sums[32];
 
     for (size_t b = 0; b < BitWidth; ++b) {
         compute_inner_products<D>(lut, block.planes[b], plane_sums);
-        if (b == 0) {
-            std::memcpy(out_msb, plane_sums, 32 * sizeof(uint32_t));
-        }
-        uint32_t weight = 1u << (BitWidth - 1 - b);
-        for (size_t i = 0; i < 32; ++i) {
-            out_nbit[i] += weight * plane_sums[i];
+        if (b == 0) std::memcpy(out_msb, plane_sums, 32 * sizeof(uint32_t));
+        __m256i vweight = _mm256_set1_epi32(1u << (BitWidth - 1 - b));
+        for (size_t i = 0; i < 32; i += 8) {
+            __m256i vout = _mm256_load_si256(reinterpret_cast<const __m256i*>(out_nbit + i));
+            __m256i vplane = _mm256_load_si256(reinterpret_cast<const __m256i*>(plane_sums + i));
+            _mm256_store_si256(reinterpret_cast<__m256i*>(out_nbit + i),
+                _mm256_add_epi32(vout, _mm256_mullo_epi32(vweight, vplane)));
         }
     }
 }
-
 
 template <size_t D, size_t BitWidth>
 inline void convert_nbit_to_distances_with_bounds(
@@ -228,39 +193,79 @@ inline void convert_nbit_to_distances_with_bounds(
     const uint16_t* msb_popcounts,
     const uint16_t* weighted_popcounts,
     size_t count,
-    float* out_dist,
-    float* out_lower,
+    float* __restrict__ out_dist,
+    float* __restrict__ out_lower,
     float dist_qp_sq)
 {
-    constexpr float K = static_cast<float>((1u << BitWidth) - 1);
-    constexpr float inv_K = 1.0f / K;
+    constexpr float inv_K = 1.0f / static_cast<float>((1u << BitWidth) - 1);
 
-    float A_nbit = query.coeff_fastscan * inv_K;
-    float B_nbit = query.coeff_popcount * inv_K;
-    float C = query.coeff_constant;
-    float affine_a = query.affine_a;
-    float affine_b = query.affine_b;
-    float ip_qo_floor = query.ip_qo_floor;
-    float dot_slack = query.dot_slack;
-    float A_msb = query.coeff_fastscan;
-    float B_msb = query.coeff_popcount;
-    float sqrt_dqp = std::sqrt(dist_qp_sq);
-
-    if (dist_qp_sq < constants::eps::kSmall) {
-        for (size_t i = 0; i < count; ++i) {
-            float nop = nop_arr[i];
-            out_dist[i] = nop * nop + dist_qp_sq;
-            out_lower[i] = 0.0f;
-        }
-        return;
-    }
+    const float A_nbit = query.coeff_fastscan * inv_K;
+    const float B_nbit = query.coeff_popcount * inv_K;
+    const float C = query.coeff_constant;
+    const float affine_a = query.affine_a;
+    const float affine_b = query.affine_b;
+    const float ip_qo_floor = query.ip_qo_floor;
+    const float dot_slack = query.dot_slack;
+    const float sqrt_dqp = std::sqrt(dist_qp_sq);
 
     size_t i = 0;
 
+#ifdef __AVX512F__
+    const __m512 vA_nbit_w = _mm512_set1_ps(A_nbit);
+    const __m512 vB_nbit_w = _mm512_set1_ps(B_nbit);
+    const __m512 vA_msb_w = _mm512_set1_ps(query.coeff_fastscan);
+    const __m512 vB_msb_w = _mm512_set1_ps(query.coeff_popcount);
+    const __m512 vC_w = _mm512_set1_ps(C);
+    const __m512 vaffine_a_w = _mm512_set1_ps(affine_a);
+    const __m512 vaffine_b_w = _mm512_set1_ps(affine_b);
+    const __m512 vfloor_w = _mm512_set1_ps(ip_qo_floor);
+    const __m512 vdot_slack_w = _mm512_set1_ps(dot_slack);
+    const __m512 vsqrt_dqp_w = _mm512_set1_ps(sqrt_dqp);
+    const __m512 vdist_qp_sq_w = _mm512_set1_ps(dist_qp_sq);
+    const __m512 vone_w = _mm512_set1_ps(1.0f);
+    const __m512 vneg_one_w = _mm512_set1_ps(-1.0f);
+    const __m512 vrcp_sqrt_dqp_w = rcp_nr(vsqrt_dqp_w);
+
+    for (; i + 16 <= count; i += 16) {
+        __m512 nbit_fs = _mm512_cvtepi32_ps(_mm512_loadu_si512(nbit_fastscan_sums + i));
+        __m512 vwpc = _mm512_cvtepi32_ps(_mm512_cvtepu16_epi32(
+            _mm256_load_si256(reinterpret_cast<const __m256i*>(weighted_popcounts + i))));
+        __m512 ip_approx_nbit = _mm512_fmadd_ps(vA_nbit_w, nbit_fs, _mm512_fmadd_ps(vB_nbit_w, vwpc, vC_w));
+
+        __m512 ip_qo_p = _mm512_max_ps(_mm512_load_ps(ip_qo_p_arr + i), vfloor_w);
+        __m512 ip_cp = _mm512_load_ps(ip_cp_arr + i);
+        __m512 nop = _mm512_load_ps(nop_arr + i);
+        __m512 rcp_qo = rcp_nr(ip_qo_p);
+
+        __m512 ip_est_nbit = _mm512_fmadd_ps(vaffine_a_w,
+            _mm512_mul_ps(_mm512_sub_ps(ip_approx_nbit, ip_cp), rcp_qo), vaffine_b_w);
+
+        __m512 two_nop = _mm512_add_ps(nop, nop);
+        __m512 nop_sq_plus_dqp = _mm512_fmadd_ps(nop, nop, vdist_qp_sq_w);
+
+        _mm512_store_ps(out_dist + i,
+            _mm512_fnmadd_ps(two_nop, ip_est_nbit, nop_sq_plus_dqp));
+
+        __m512 msb_fs = _mm512_cvtepi32_ps(_mm512_loadu_si512(msb_fastscan_sums + i));
+        __m512 vmpc = _mm512_cvtepi32_ps(_mm512_cvtepu16_epi32(
+            _mm256_load_si256(reinterpret_cast<const __m256i*>(msb_popcounts + i))));
+        __m512 ip_est_msb = _mm512_fmadd_ps(vaffine_a_w,
+            _mm512_mul_ps(_mm512_sub_ps(
+                _mm512_fmadd_ps(vA_msb_w, msb_fs, _mm512_fmadd_ps(vB_msb_w, vmpc, vC_w)), ip_cp), rcp_qo), vaffine_b_w);
+
+        __m512 cos_upper = _mm512_min_ps(_mm512_max_ps(
+            _mm512_mul_ps(_mm512_add_ps(ip_est_msb, vdot_slack_w), vrcp_sqrt_dqp_w),
+            vneg_one_w), vone_w);
+
+        _mm512_store_ps(out_lower + i,
+            _mm512_fnmadd_ps(_mm512_mul_ps(two_nop, vsqrt_dqp_w), cos_upper, nop_sq_plus_dqp));
+    }
+#endif
+
     const __m256 vA_nbit = _mm256_set1_ps(A_nbit);
     const __m256 vB_nbit = _mm256_set1_ps(B_nbit);
-    const __m256 vA_msb = _mm256_set1_ps(A_msb);
-    const __m256 vB_msb = _mm256_set1_ps(B_msb);
+    const __m256 vA_msb = _mm256_set1_ps(query.coeff_fastscan);
+    const __m256 vB_msb = _mm256_set1_ps(query.coeff_popcount);
     const __m256 vC = _mm256_set1_ps(C);
     const __m256 vaffine_a = _mm256_set1_ps(affine_a);
     const __m256 vaffine_b = _mm256_set1_ps(affine_b);
@@ -268,107 +273,83 @@ inline void convert_nbit_to_distances_with_bounds(
     const __m256 vdot_slack = _mm256_set1_ps(dot_slack);
     const __m256 vsqrt_dqp = _mm256_set1_ps(sqrt_dqp);
     const __m256 vdist_qp_sq = _mm256_set1_ps(dist_qp_sq);
-    const __m256 vip_thresh = _mm256_set1_ps(constants::eps::kMedium);
-    const __m256 vzero = _mm256_setzero_ps();
     const __m256 vone = _mm256_set1_ps(1.0f);
     const __m256 vneg_one = _mm256_set1_ps(-1.0f);
-    const __m256 vtwo = _mm256_set1_ps(2.0f);
+    const __m256 vrcp_sqrt_dqp = rcp_nr(vsqrt_dqp);
 
     for (; i + 8 <= count; i += 8) {
         __m256 nbit_fs = _mm256_cvtepi32_ps(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(nbit_fastscan_sums + i)));
-        __m128i wpc16 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(weighted_popcounts + i));
-        __m256 vwpc = _mm256_cvtepi32_ps(_mm256_cvtepu16_epi32(wpc16));
+        __m256 vwpc = _mm256_cvtepi32_ps(_mm256_cvtepu16_epi32(
+            _mm_load_si128(reinterpret_cast<const __m128i*>(weighted_popcounts + i))));
         __m256 ip_approx_nbit = _mm256_fmadd_ps(vA_nbit, nbit_fs, _mm256_fmadd_ps(vB_nbit, vwpc, vC));
 
-        __m256 ip_qo_p = _mm256_loadu_ps(ip_qo_p_arr + i);
-        __m256 ip_cp = _mm256_loadu_ps(ip_cp_arr + i);
-        __m256 nop = _mm256_loadu_ps(nop_arr + i);
+        __m256 ip_qo_p = _mm256_max_ps(_mm256_load_ps(ip_qo_p_arr + i), vfloor);
+        __m256 ip_cp = _mm256_load_ps(ip_cp_arr + i);
+        __m256 nop = _mm256_load_ps(nop_arr + i);
+        __m256 rcp_qo = rcp_nr(ip_qo_p);
 
-        ip_qo_p = _mm256_max_ps(ip_qo_p, vfloor);
+        __m256 ip_est_nbit = _mm256_fmadd_ps(vaffine_a,
+            _mm256_mul_ps(_mm256_sub_ps(ip_approx_nbit, ip_cp), rcp_qo), vaffine_b);
 
-        __m256 ip_corrected_nbit = _mm256_sub_ps(ip_approx_nbit, ip_cp);
-        __m256 mask_good = _mm256_cmp_ps(ip_qo_p, vip_thresh, _CMP_GT_OQ);
-        __m256 ip_est_nbit = _mm256_and_ps(mask_good, _mm256_div_ps(ip_corrected_nbit, ip_qo_p));
+        __m256 two_nop = _mm256_add_ps(nop, nop);
+        __m256 nop_sq_plus_dqp = _mm256_fmadd_ps(nop, nop, vdist_qp_sq);
 
-        ip_est_nbit = _mm256_fmadd_ps(vaffine_a, ip_est_nbit, vaffine_b);
-
-        __m256 dist = _mm256_fmadd_ps(nop, nop, vdist_qp_sq);
-        dist = _mm256_fnmadd_ps(_mm256_mul_ps(vtwo, nop), ip_est_nbit, dist);
-        dist = _mm256_max_ps(dist, vzero);
+        _mm256_store_ps(out_dist + i,
+            _mm256_fnmadd_ps(two_nop, ip_est_nbit, nop_sq_plus_dqp));
 
         __m256 msb_fs = _mm256_cvtepi32_ps(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(msb_fastscan_sums + i)));
-        __m128i mpc16 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(msb_popcounts + i));
-        __m256 vmpc = _mm256_cvtepi32_ps(_mm256_cvtepu16_epi32(mpc16));
-        __m256 ip_approx_msb = _mm256_fmadd_ps(vA_msb, msb_fs, _mm256_fmadd_ps(vB_msb, vmpc, vC));
+        __m256 vmpc = _mm256_cvtepi32_ps(_mm256_cvtepu16_epi32(
+            _mm_load_si128(reinterpret_cast<const __m128i*>(msb_popcounts + i))));
+        __m256 ip_est_msb = _mm256_fmadd_ps(vaffine_a,
+            _mm256_mul_ps(_mm256_sub_ps(
+                _mm256_fmadd_ps(vA_msb, msb_fs, _mm256_fmadd_ps(vB_msb, vmpc, vC)), ip_cp), rcp_qo), vaffine_b);
 
-        __m256 ip_corrected_msb = _mm256_sub_ps(ip_approx_msb, ip_cp);
-        __m256 ip_est_msb = _mm256_and_ps(mask_good, _mm256_div_ps(ip_corrected_msb, ip_qo_p));
-        ip_est_msb = _mm256_fmadd_ps(vaffine_a, ip_est_msb, vaffine_b);
+        __m256 cos_upper = _mm256_min_ps(_mm256_max_ps(
+            _mm256_mul_ps(_mm256_add_ps(ip_est_msb, vdot_slack), vrcp_sqrt_dqp),
+            vneg_one), vone);
 
-        __m256 cos_upper = _mm256_div_ps(
-            _mm256_add_ps(ip_est_msb, vdot_slack),
-            _mm256_max_ps(vsqrt_dqp, vip_thresh));
-        cos_upper = _mm256_min_ps(_mm256_max_ps(cos_upper, vneg_one), vone);
-
-        __m256 lower = _mm256_fmadd_ps(nop, nop, vdist_qp_sq);
-        lower = _mm256_fnmadd_ps(_mm256_mul_ps(_mm256_mul_ps(vtwo, nop), vsqrt_dqp), cos_upper, lower);
-        lower = _mm256_max_ps(lower, vzero);
-
-        lower = _mm256_and_ps(mask_good, lower);
-
-        _mm256_storeu_ps(out_dist + i, dist);
-        _mm256_storeu_ps(out_lower + i, lower);
+        _mm256_store_ps(out_lower + i,
+            _mm256_fnmadd_ps(_mm256_mul_ps(two_nop, vsqrt_dqp), cos_upper, nop_sq_plus_dqp));
     }
 
-    // Scalar tail for remainder when count is not a multiple of 8
     for (; i < count; ++i) {
-        float ip_approx_nbit = A_nbit * static_cast<float>(nbit_fastscan_sums[i])
-                             + B_nbit * static_cast<float>(weighted_popcounts[i]) + C;
         float ip_qo_p = std::max(ip_qo_p_arr[i], ip_qo_floor);
-        float ip_corrected_nbit = ip_approx_nbit - ip_cp_arr[i];
-        float ip_est_nbit = (ip_qo_p > constants::eps::kMedium) ? ip_corrected_nbit / ip_qo_p : 0.0f;
-        ip_est_nbit = affine_a * ip_est_nbit + affine_b;
+        float rcp_qo = 1.0f / ip_qo_p;
         float nop = nop_arr[i];
-        out_dist[i] = std::max(nop * nop + dist_qp_sq - 2.0f * nop * ip_est_nbit, 0.0f);
+        float nop_sq_dqp = nop * nop + dist_qp_sq;
 
-        if (ip_qo_p <= constants::eps::kMedium) {
-            out_lower[i] = 0.0f;
-            continue;
-        }
+        float ip_est_nbit = affine_a * ((A_nbit * static_cast<float>(nbit_fastscan_sums[i])
+            + B_nbit * static_cast<float>(weighted_popcounts[i]) + C - ip_cp_arr[i]) * rcp_qo) + affine_b;
+        out_dist[i] = nop_sq_dqp - 2.0f * nop * ip_est_nbit;
 
-        float ip_approx_msb = A_msb * static_cast<float>(msb_fastscan_sums[i])
-                            + B_msb * static_cast<float>(msb_popcounts[i]) + C;
-        float ip_corrected_msb = ip_approx_msb - ip_cp_arr[i];
-        float ip_est_msb = affine_a * (ip_corrected_msb / ip_qo_p) + affine_b;
+        float ip_est_msb = affine_a * ((query.coeff_fastscan * static_cast<float>(msb_fastscan_sums[i])
+            + query.coeff_popcount * static_cast<float>(msb_popcounts[i]) + C - ip_cp_arr[i]) * rcp_qo) + affine_b;
         float cos_upper = std::clamp((ip_est_msb + dot_slack) / sqrt_dqp, -1.0f, 1.0f);
-        out_lower[i] = std::max(nop * nop + dist_qp_sq - 2.0f * nop * sqrt_dqp * cos_upper, 0.0f);
+        out_lower[i] = nop_sq_dqp - 2.0f * nop * sqrt_dqp * cos_upper;
     }
 }
-
 
 template <size_t D, size_t BitWidth>
 inline void compute_msb_only_inner_products(
     const uint8_t lut[][16],
-    const NbitFastScanCodeBlock<D, BitWidth, 32>& block,
-    uint32_t* out_msb)
+    const NbitFastScanCodeBlock<D, BitWidth>& block,
+    uint32_t* __restrict__ out_msb)
 {
-    constexpr size_t N_BOUND_PLANES = (BitWidth < 2) ? 1 : 2;
-
     compute_inner_products<D>(lut, block.planes[0], out_msb);
 
-    if constexpr (N_BOUND_PLANES >= 2 && BitWidth >= 2) {
+    if constexpr (BitWidth >= 2) {
         alignas(64) uint32_t plane1_sums[32];
         compute_inner_products<D>(lut, block.planes[1], plane1_sums);
-
-
-        for (size_t i = 0; i < 32; ++i) {
-            out_msb[i] = 2 * out_msb[i] + plane1_sums[i];
+        for (size_t i = 0; i < 32; i += 8) {
+            __m256i vmsb = _mm256_load_si256(reinterpret_cast<const __m256i*>(out_msb + i));
+            __m256i vp1 = _mm256_load_si256(reinterpret_cast<const __m256i*>(plane1_sums + i));
+            _mm256_store_si256(reinterpret_cast<__m256i*>(out_msb + i),
+                _mm256_add_epi32(_mm256_slli_epi32(vmsb, 1), vp1));
         }
     }
 }
 
-
-template <size_t D, size_t BitWidth = 1>
+template <size_t D, size_t BitWidth>
 inline void convert_msb_to_lower_bounds(
     const RaBitQQuery<D>& query,
     const uint32_t* msb_fastscan_sums,
@@ -377,50 +358,102 @@ inline void convert_msb_to_lower_bounds(
     const float* ip_cp_arr,
     const uint16_t* msb_popcounts,
     size_t count,
-    float* out_lower,
+    float* __restrict__ out_lower,
     float dist_qp_sq)
 {
-    constexpr size_t N_BOUND_PLANES = (BitWidth < 2) ? 1 : 2;
-    constexpr float K_PARTIAL = (N_BOUND_PLANES >= 2) ? 3.0f : 1.0f;
-    constexpr float INV_K_PARTIAL = 1.0f / K_PARTIAL;
+    constexpr float INV_K_PARTIAL = 1.0f / 3.0f;
 
-    float A = query.coeff_fastscan * INV_K_PARTIAL;
-    float B = query.coeff_popcount * INV_K_PARTIAL;
-    float C = query.coeff_constant;
-    float affine_a = query.affine_a;
-    float affine_b = query.affine_b;
-    float ip_qo_floor = query.ip_qo_floor;
-    float dot_slack = query.dot_slack;
-    float sqrt_dqp = std::sqrt(dist_qp_sq);
+    const float A = query.coeff_fastscan * INV_K_PARTIAL;
+    const float B = query.coeff_popcount * INV_K_PARTIAL;
+    const float C = query.coeff_constant;
+    const float affine_a = query.affine_a;
+    const float affine_b = query.affine_b;
+    const float ip_qo_floor = query.ip_qo_floor;
+    const float dot_slack = query.dot_slack;
+    const float sqrt_dqp = std::sqrt(dist_qp_sq);
 
-    if (dist_qp_sq < constants::eps::kSmall) {
-        for (size_t i = 0; i < count; ++i) {
-            out_lower[i] = 0.0f;
-        }
-        return;
+    size_t i = 0;
+
+#ifdef __AVX512F__
+    const __m512 vA_w = _mm512_set1_ps(A);
+    const __m512 vB_w = _mm512_set1_ps(B);
+    const __m512 vC_w = _mm512_set1_ps(C);
+    const __m512 vaffine_a_w = _mm512_set1_ps(affine_a);
+    const __m512 vaffine_b_w = _mm512_set1_ps(affine_b);
+    const __m512 vfloor_w = _mm512_set1_ps(ip_qo_floor);
+    const __m512 vdot_slack_w = _mm512_set1_ps(dot_slack);
+    const __m512 vsqrt_dqp_w = _mm512_set1_ps(sqrt_dqp);
+    const __m512 vdist_qp_sq_w = _mm512_set1_ps(dist_qp_sq);
+    const __m512 vone_w = _mm512_set1_ps(1.0f);
+    const __m512 vneg_one_w = _mm512_set1_ps(-1.0f);
+    const __m512 vrcp_sqrt_dqp_w = rcp_nr(vsqrt_dqp_w);
+
+    for (; i + 16 <= count; i += 16) {
+        __m512 fs = _mm512_cvtepi32_ps(_mm512_loadu_si512(msb_fastscan_sums + i));
+        __m512 vpc = _mm512_cvtepi32_ps(_mm512_cvtepu16_epi32(
+            _mm256_load_si256(reinterpret_cast<const __m256i*>(msb_popcounts + i))));
+        __m512 ip_approx = _mm512_fmadd_ps(vA_w, fs, _mm512_fmadd_ps(vB_w, vpc, vC_w));
+
+        __m512 ip_qo_p = _mm512_max_ps(_mm512_load_ps(ip_qo_p_arr + i), vfloor_w);
+        __m512 ip_cp = _mm512_load_ps(ip_cp_arr + i);
+        __m512 nop = _mm512_load_ps(nop_arr + i);
+
+        __m512 ip_est = _mm512_fmadd_ps(vaffine_a_w,
+            _mm512_mul_ps(_mm512_sub_ps(ip_approx, ip_cp), rcp_nr(ip_qo_p)), vaffine_b_w);
+
+        __m512 cos_upper = _mm512_min_ps(_mm512_max_ps(
+            _mm512_mul_ps(_mm512_add_ps(ip_est, vdot_slack_w), vrcp_sqrt_dqp_w),
+            vneg_one_w), vone_w);
+
+        __m512 two_nop = _mm512_add_ps(nop, nop);
+        _mm512_store_ps(out_lower + i,
+            _mm512_fnmadd_ps(_mm512_mul_ps(two_nop, vsqrt_dqp_w), cos_upper,
+                _mm512_fmadd_ps(nop, nop, vdist_qp_sq_w)));
+    }
+#endif
+
+    const __m256 vA = _mm256_set1_ps(A);
+    const __m256 vB = _mm256_set1_ps(B);
+    const __m256 vC = _mm256_set1_ps(C);
+    const __m256 vaffine_a = _mm256_set1_ps(affine_a);
+    const __m256 vaffine_b = _mm256_set1_ps(affine_b);
+    const __m256 vfloor = _mm256_set1_ps(ip_qo_floor);
+    const __m256 vdot_slack = _mm256_set1_ps(dot_slack);
+    const __m256 vsqrt_dqp = _mm256_set1_ps(sqrt_dqp);
+    const __m256 vdist_qp_sq = _mm256_set1_ps(dist_qp_sq);
+    const __m256 vone = _mm256_set1_ps(1.0f);
+    const __m256 vneg_one = _mm256_set1_ps(-1.0f);
+    const __m256 vrcp_sqrt_dqp = rcp_nr(vsqrt_dqp);
+
+    for (; i + 8 <= count; i += 8) {
+        __m256 fs = _mm256_cvtepi32_ps(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(msb_fastscan_sums + i)));
+        __m256 vpc = _mm256_cvtepi32_ps(_mm256_cvtepu16_epi32(
+            _mm_load_si128(reinterpret_cast<const __m128i*>(msb_popcounts + i))));
+        __m256 ip_approx = _mm256_fmadd_ps(vA, fs, _mm256_fmadd_ps(vB, vpc, vC));
+
+        __m256 ip_qo_p = _mm256_max_ps(_mm256_load_ps(ip_qo_p_arr + i), vfloor);
+        __m256 ip_cp = _mm256_load_ps(ip_cp_arr + i);
+        __m256 nop = _mm256_load_ps(nop_arr + i);
+
+        __m256 ip_est = _mm256_fmadd_ps(vaffine_a,
+            _mm256_mul_ps(_mm256_sub_ps(ip_approx, ip_cp), rcp_nr(ip_qo_p)), vaffine_b);
+
+        __m256 cos_upper = _mm256_min_ps(_mm256_max_ps(
+            _mm256_mul_ps(_mm256_add_ps(ip_est, vdot_slack), vrcp_sqrt_dqp),
+            vneg_one), vone);
+
+        __m256 two_nop = _mm256_add_ps(nop, nop);
+        _mm256_store_ps(out_lower + i,
+            _mm256_fnmadd_ps(_mm256_mul_ps(two_nop, vsqrt_dqp), cos_upper,
+                _mm256_fmadd_ps(nop, nop, vdist_qp_sq)));
     }
 
-    for (size_t i = 0; i < count; ++i) {
+    for (; i < count; ++i) {
         float ip_approx = A * static_cast<float>(msb_fastscan_sums[i])
-                        + B * static_cast<float>(msb_popcounts[i])
-                        + C;
-
-        float ip_qo_p = std::max(ip_qo_p_arr[i], ip_qo_floor);
-        float nop = nop_arr[i];
-
-        if (ip_qo_p <= constants::eps::kMedium) {
-            out_lower[i] = 0.0f;
-            continue;
-        }
-
-        float ip_corrected = ip_approx - ip_cp_arr[i];
-        float ip_est = ip_corrected / ip_qo_p;
-        ip_est = affine_a * ip_est + affine_b;
-
+                        + B * static_cast<float>(msb_popcounts[i]) + C;
+        float ip_est = affine_a * ((ip_approx - ip_cp_arr[i]) / std::max(ip_qo_p_arr[i], ip_qo_floor)) + affine_b;
         float cos_upper = std::clamp((ip_est + dot_slack) / sqrt_dqp, -1.0f, 1.0f);
-
-        out_lower[i] = nop * nop + dist_qp_sq - 2.0f * nop * sqrt_dqp * cos_upper;
-        if (out_lower[i] < 0.0f) out_lower[i] = 0.0f;
+        out_lower[i] = nop_arr[i] * nop_arr[i] + dist_qp_sq - 2.0f * nop_arr[i] * sqrt_dqp * cos_upper;
     }
 }
 

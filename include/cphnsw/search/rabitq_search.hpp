@@ -1,18 +1,83 @@
 #pragma once
 
-#include "../core/codes.hpp"
-#include "../core/constants.hpp"
+#include "../core/core.hpp"
 #include "../distance/fastscan_kernel.hpp"
-#include "../distance/fastscan_layout.hpp"
 #include "../graph/rabitq_graph.hpp"
-#include "../core/types.hpp"
-#include "../graph/visitation_table.hpp"
+#include <memory>
 #include <vector>
 #include <queue>
 #include <algorithm>
 #include <limits>
 
 namespace cphnsw {
+
+// ============================================================
+// Two-Level Visitation Table (formerly visitation_table.hpp)
+// ============================================================
+
+class TwoLevelVisitationTable {
+public:
+    explicit TwoLevelVisitationTable(size_t capacity)
+        : capacity_(capacity), current_epoch_(0) {
+        estimated_ = std::make_unique<uint64_t[]>(capacity);
+        visited_ = std::make_unique<uint64_t[]>(capacity);
+        std::memset(estimated_.get(), 0, capacity * sizeof(uint64_t));
+        std::memset(visited_.get(), 0, capacity * sizeof(uint64_t));
+    }
+
+    TwoLevelVisitationTable(const TwoLevelVisitationTable&) = delete;
+    TwoLevelVisitationTable& operator=(const TwoLevelVisitationTable&) = delete;
+    TwoLevelVisitationTable(TwoLevelVisitationTable&&) = delete;
+    TwoLevelVisitationTable& operator=(TwoLevelVisitationTable&&) = delete;
+
+    uint64_t new_query() const {
+        return ++current_epoch_;
+    }
+
+    bool check_and_mark_estimated(NodeId node_id, uint64_t query_id) const {
+        if (estimated_[node_id] == query_id) return true;
+        estimated_[node_id] = query_id;
+        return false;
+    }
+
+    bool check_and_mark_visited(NodeId node_id, uint64_t query_id) const {
+        if (visited_[node_id] == query_id) return true;
+        visited_[node_id] = query_id;
+        return false;
+    }
+
+    bool is_visited(NodeId node_id, uint64_t query_id) const {
+        return visited_[node_id] == query_id;
+    }
+
+    void prefetch_estimated(NodeId node_id) const {
+        prefetch_t<0>(reinterpret_cast<const char*>(&estimated_[node_id]));
+    }
+
+    void resize(size_t new_capacity) {
+        auto new_est = std::make_unique<uint64_t[]>(new_capacity);
+        auto new_vis = std::make_unique<uint64_t[]>(new_capacity);
+        std::memcpy(new_est.get(), estimated_.get(), capacity_ * sizeof(uint64_t));
+        std::memcpy(new_vis.get(), visited_.get(), capacity_ * sizeof(uint64_t));
+        std::memset(new_est.get() + capacity_, 0, (new_capacity - capacity_) * sizeof(uint64_t));
+        std::memset(new_vis.get() + capacity_, 0, (new_capacity - capacity_) * sizeof(uint64_t));
+        estimated_ = std::move(new_est);
+        visited_ = std::move(new_vis);
+        capacity_ = new_capacity;
+    }
+
+    size_t capacity() const { return capacity_; }
+
+private:
+    mutable std::unique_ptr<uint64_t[]> estimated_;
+    mutable std::unique_ptr<uint64_t[]> visited_;
+    size_t capacity_;
+    mutable uint64_t current_epoch_;
+};
+
+// ============================================================
+// RaBitQ Search
+// ============================================================
 
 template <typename T>
 class BoundedMaxHeap {
@@ -67,10 +132,7 @@ std::vector<SearchResult> search(
     TwoLevelVisitationTable& visited,
     NodeId entry,
     const float* slack_levels,
-    int num_slack_levels,
-    float gamma_max,
-    float gamma_beta,
-    size_t gamma_warmup)
+    int num_slack_levels)
 {
     NodeId ep = entry;
 
@@ -81,15 +143,11 @@ std::vector<SearchResult> search(
     BoundedMaxHeap<SearchResult> nn(k);
 
 
-    float gamma_q = gamma;
-    double ratio_sum = 0.0, ratio_sq_sum = 0.0;
-    size_t ratio_count = 0;
-
     float query_norm_sq = dot_product_simd<D>(raw_query, raw_query);
 
     auto exact_l2 = [&](NodeId id) -> float {
-        return std::max(query_norm_sq + graph.get_norm_sq(id)
-               - 2.0f * dot_product_simd<D>(raw_query, graph.get_vector(id)), 0.0f);
+        return query_norm_sq + graph.get_norm_sq(id)
+               - 2.0f * dot_product_simd<D>(raw_query, graph.get_vector(id));
     };
 
     float ep_est = exact_l2(ep);
@@ -117,7 +175,7 @@ std::vector<SearchResult> search(
         if (!found) break;
 
 
-        if (nn.size() >= k && current.est_distance >= gamma_q * nn.worst_distance()) break;
+        if (nn.size() >= k && current.est_distance >= gamma * nn.worst_distance()) [[unlikely]] break;
 
         if (nn.size() >= k && current.lower_bound > nn.worst_distance()) continue;
 
@@ -134,17 +192,12 @@ std::vector<SearchResult> search(
 
         const auto& nb = graph.get_neighbors(current.id);
         size_t n_neighbors = nb.size();
-        if (n_neighbors == 0) continue;
-
         float dist_qp_sq = exact_dist;
 
-        if (slack_levels && num_slack_levels > 0) {
-            int level_idx = std::min(slack_batch_count, num_slack_levels - 1);
-            query.dot_slack = slack_levels[level_idx];
-            ++slack_batch_count;
-        }
+        query.dot_slack = slack_levels[std::min(slack_batch_count, num_slack_levels - 1)];
+        ++slack_batch_count;
 
-        constexpr size_t BATCH = constants::kFastScanBatch;
+        constexpr size_t BATCH = fastscan::BATCH_SIZE;
         size_t num_batches = (R + BATCH - 1) / BATCH;
 
         for (size_t batch = 0; batch < num_batches; ++batch) {
@@ -156,17 +209,8 @@ std::vector<SearchResult> search(
                 prefetch_t<0>(reinterpret_cast<const char*>(&nb.code_blocks[batch + 1]));
             }
 
-            if constexpr (BitWidth == 1) {
-                fastscan::compute_inner_products(
-                    query.lut, nb.code_blocks[batch],
-                    fastscan_sums + batch_start);
-                fastscan::convert_to_distances_with_bounds(
-                    query, fastscan_sums + batch_start,
-                    nb.nop + batch_start, nb.ip_qo + batch_start,
-                    nb.ip_cp + batch_start, nb.popcounts + batch_start,
-                    batch_count, est_distances + batch_start,
-                    lower_bounds + batch_start, dist_qp_sq);
-            } else {
+            if constexpr (BitWidth >= 2) {
+                // MSB shortcut path
                 fastscan::compute_msb_only_inner_products<D, BitWidth>(
                     query.lut, nb.code_blocks[batch], msb_sums + batch_start);
                 fastscan::convert_msb_to_lower_bounds<D, BitWidth>(
@@ -203,32 +247,47 @@ std::vector<SearchResult> search(
                         est_distances[batch_start + j] = std::numeric_limits<float>::max();
                     }
                 }
+            } else {
+                // BitWidth=1: compute directly, no MSB shortcut
+                fastscan::compute_nbit_inner_products<D, BitWidth>(
+                    query.lut, nb.code_blocks[batch],
+                    fastscan_sums + batch_start, msb_sums + batch_start);
+                fastscan::convert_nbit_to_distances_with_bounds<D, BitWidth>(
+                    query, fastscan_sums + batch_start,
+                    msb_sums + batch_start,
+                    nb.nop + batch_start, nb.ip_qo + batch_start,
+                    nb.ip_cp + batch_start, nb.popcounts + batch_start,
+                    nb.weighted_popcounts + batch_start,
+                    batch_count, est_distances + batch_start,
+                    lower_bounds + batch_start, dist_qp_sq);
             }
         }
 
 
         bool warmup = (nn.size() < k);
 
-        size_t prefetch_count = std::min(n_neighbors, constants::kPrefetchNeighbors);
+        size_t prefetch_count = std::min(n_neighbors, size_t(8));
         for (size_t i = 0; i < prefetch_count; ++i) {
             NodeId nid = nb.neighbor_ids[i];
             visited.prefetch_estimated(nid);
+            graph.prefetch_norm(nid);
         }
 
         for (size_t i = 0; i < n_neighbors; ++i) {
-            if (i + constants::kPrefetchStride < n_neighbors) {
-                NodeId future_id = nb.neighbor_ids[i + constants::kPrefetchStride];
+            if (i + size_t(4) < n_neighbors) {
+                NodeId future_id = nb.neighbor_ids[i + size_t(4)];
                 if (future_id != INVALID_NODE) {
                     graph.prefetch_vertex(future_id);
+                    graph.prefetch_vector(future_id);
+                    graph.prefetch_norm(future_id);
                 }
             }
 
             NodeId neighbor_id = nb.neighbor_ids[i];
             if (visited.check_and_mark_estimated(neighbor_id, query_id)) continue;
 
-            // DABS candidate-queue filtering threshold
             float dabs_threshold = (nn.size() >= k)
-                ? gamma_q * nn.worst_distance()
+                ? gamma * nn.worst_distance()
                 : std::numeric_limits<float>::max();
 
             if (warmup) {
@@ -252,20 +311,6 @@ std::vector<SearchResult> search(
                     beam.push({exact, lower, neighbor_id});
                 }
 
-                if (exact > constants::eps::kSmall) {
-                    double r = est_dist / exact;
-                    ratio_sum += r;
-                    ratio_sq_sum += r * r;
-                    ++ratio_count;
-                    if (ratio_count >= gamma_warmup) {
-                        double r_mean = ratio_sum / ratio_count;
-                        double r_var = ratio_sq_sum / ratio_count - r_mean * r_mean;
-                        double r_std = std::sqrt(std::max(r_var, 0.0));
-                        gamma_q = std::clamp(
-                            gamma * static_cast<float>(1.0 + gamma_beta * r_std),
-                            gamma, gamma_max);
-                    }
-                }
             } else if (est_dist < dabs_threshold) {
                 beam.push({est_dist, lower, neighbor_id});
             }

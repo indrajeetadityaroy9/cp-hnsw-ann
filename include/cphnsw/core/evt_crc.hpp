@@ -1,7 +1,7 @@
 #pragma once
 
-#include "constants.hpp"
 #include <cmath>
+#include <limits>
 #include <cstddef>
 #include <cstdint>
 #include <algorithm>
@@ -13,8 +13,6 @@ namespace evt_detail {
     static constexpr int kEmpiricalCheckpoints = 8;
     static constexpr float kCheckpointAlphas[kEmpiricalCheckpoints] =
         {0.5f, 0.1f, 0.05f, 0.01f, 0.005f, 0.001f, 5e-4f, 1e-4f};
-    // Lilliefors correction: inflate critical value by 1.25x for estimated parameters
-    static constexpr float kKsInflation = 1.25f;
 }
 
 struct EVTState {
@@ -32,8 +30,6 @@ namespace evt_crc {
 
 
 inline float evt_quantile(float alpha, const EVTState& evt) {
-    alpha = std::clamp(alpha, constants::kEvtAlphaMin, constants::kEvtAlphaMax);
-
     if (alpha >= evt.p_u) {
         return evt.u;
     }
@@ -43,27 +39,24 @@ inline float evt_quantile(float alpha, const EVTState& evt) {
         const float* A = evt_detail::kCheckpointAlphas;
         const float* Q = evt.empirical_checkpoints;
 
-        // Find bracketing interval
         for (int j = 0; j < N - 1; ++j) {
             if (alpha >= A[j + 1]) {
                 float t = (alpha - A[j + 1]) / (A[j] - A[j + 1]);
                 return Q[j + 1] * (1.0f - t) + Q[j] * t;
             }
         }
-        // Log-linear extrapolation beyond finest checkpoint
         if (N >= 2 && A[N-2] > A[N-1]) {
             float log_ratio = std::log(A[N-2] / A[N-1]);
-            float slope = (log_ratio > constants::eps::kSmall)
+            float slope = (log_ratio > std::numeric_limits<float>::epsilon())
                 ? (Q[N-1] - Q[N-2]) / log_ratio : 0.0f;
             return Q[N-1] + slope * std::log(A[N-1] / alpha);
         }
         return Q[N - 1];
     }
 
-    // Original GPD quantile
     float ratio = evt.p_u / alpha;
 
-    if (std::abs(evt.xi) < constants::eps::kLarge) {
+    if (std::abs(evt.xi) < std::numeric_limits<float>::epsilon()) {
         return evt.u + evt.beta * std::log(ratio);
     } else {
         return evt.u + (evt.beta / evt.xi) * (std::pow(ratio, evt.xi) - 1.0f);
@@ -109,20 +102,20 @@ inline EVTState fit_gpd(const float* sorted_abs_resid, size_t n,
 
     double var_y = sum_y2 / m - mean_y * mean_y;
     double xi_mom, beta_mom;
-    if (var_y < constants::eps::kTiny) {
+    if (var_y < std::numeric_limits<float>::min()) {
         xi_mom = 0.0;
-        beta_mom = std::max(mean_y, static_cast<double>(constants::kGpdBetaMin));
+        beta_mom = std::max(mean_y, static_cast<double>(std::numeric_limits<float>::epsilon()));
     } else {
         xi_mom = 0.5 * (1.0 - mean_y * mean_y / var_y);
         beta_mom = mean_y * (1.0 - xi_mom);
     }
 
     double xi = xi_mom;
-    double beta = std::max(beta_mom, static_cast<double>(constants::kGpdBetaMin));
+    double beta = std::max(beta_mom, static_cast<double>(std::numeric_limits<float>::epsilon()));
     bool mle_converged = false;
 
-    for (int iter = 0; iter < constants::kGrimshawMaxIter; ++iter) {
-        if (std::abs(xi) < constants::eps::kLarge) {
+    for (;;) {
+        if (std::abs(xi) < std::numeric_limits<float>::epsilon()) {
             beta = mean_y;
             xi = 0.0;
             mle_converged = true;
@@ -137,7 +130,8 @@ inline EVTState fit_gpd(const float* sorted_abs_resid, size_t n,
 
 
         double beta_new = beta;
-        for (int j = 0; j < constants::kGrimshawBetaIter; ++j) {
+        for (;;) {
+            float beta_prev = beta_new;
             double sum_yz = 0.0;
             bool inner_feasible = true;
             for (uint32_t i = 0; i < m; ++i) {
@@ -147,7 +141,8 @@ inline EVTState fit_gpd(const float* sorted_abs_resid, size_t n,
             }
             if (!inner_feasible) break;
             beta_new = (1.0 + xi) * sum_yz / m;
-            if (beta_new < constants::kGpdBetaMin) beta_new = constants::kGpdBetaMin;
+            if (beta_new < std::numeric_limits<float>::epsilon()) beta_new = std::numeric_limits<float>::epsilon();
+            if (std::abs(beta_new - beta_prev) < std::numeric_limits<float>::epsilon() * std::max(beta_new, static_cast<double>(std::numeric_limits<float>::epsilon()))) break;
         }
         beta = beta_new;
 
@@ -163,12 +158,10 @@ inline EVTState fit_gpd(const float* sorted_abs_resid, size_t n,
                     - (1.0 + 1.0 / xi) * w * w;
         }
 
-        if (std::abs(info) < constants::eps::kTiny) break;
+        if (std::abs(info) < std::numeric_limits<float>::min()) break;
         double xi_new = xi - score / info;
-        xi_new = std::max(xi_new, static_cast<double>(constants::kGpdXiMin));
-        xi_new = std::min(xi_new, static_cast<double>(constants::kGpdXiMax));
 
-        if (std::abs(xi_new - xi) < constants::kGrimshawTol) {
+        if (std::abs(xi_new - xi) < std::numeric_limits<float>::epsilon()) {
             xi = xi_new;
             mle_converged = true;
             break;
@@ -181,8 +174,8 @@ inline EVTState fit_gpd(const float* sorted_abs_resid, size_t n,
         beta = beta_mom;
     }
 
-    state.xi = std::clamp(static_cast<float>(xi), constants::kGpdXiMin, constants::kGpdXiMax);
-    state.beta = std::max(static_cast<float>(beta), constants::kGpdBetaMin);
+    state.xi = static_cast<float>(xi);
+    state.beta = std::max(static_cast<float>(beta), std::numeric_limits<float>::epsilon());
     state.fitted = true;
     return state;
 }
@@ -195,7 +188,7 @@ inline float ks_test_gpd(const float* sorted_tail, size_t m,
         float y = sorted_tail[i];
         float F_emp = static_cast<float>(i + 1) / static_cast<float>(m);
         float F_gpd;
-        if (std::abs(xi) < constants::eps::kLarge) {
+        if (std::abs(xi) < std::numeric_limits<float>::epsilon()) {
             F_gpd = 1.0f - std::exp(-y / beta);
         } else {
             float z = 1.0f + xi * y / beta;
@@ -208,121 +201,23 @@ inline float ks_test_gpd(const float* sorted_tail, size_t m,
 }
 
 inline float ks_critical(size_t n) {
-    return evt_detail::kKsInflation * 1.358f
-         / std::sqrt(static_cast<float>(std::max(n, size_t(1))));
+    // Lilliefors correction for 2 estimated GPD parameters (ξ, β):
+    // inflates DKW critical value by (1 + p/sqrt(n)) where p=2
+    float sqrt_n = std::sqrt(static_cast<float>(std::max(n, size_t(1))));
+    // 1.358 = sqrt(ln(2/0.05) / 2), DKW critical value at α=0.05
+    return (1.0f + 2.0f / sqrt_n) * 1.358f / sqrt_n;
 }
 
 
 inline EVTState fit_gpd_stable(const float* sorted_abs_resid, size_t n,
-                                size_t min_tail,
-                                float thresh_min = 0.0f,
-                                float thresh_max_hint = 0.0f) {
-    // If caller didn't provide bounds, derive from sample size
-    if (thresh_min <= 0.0f) {
-        thresh_min = std::max(
-            1.0f - 1.0f / std::sqrt(static_cast<float>(std::max(n, size_t(4)))),
-            0.5f);
-    }
-    float max_thresh = (thresh_max_hint > 0.0f) ? thresh_max_hint :
-        (1.0f - static_cast<float>(min_tail) / static_cast<float>(std::max(n, size_t(1))));
+                                size_t min_tail) {
+    float thresh = 1.0f - 1.0f / std::sqrt(static_cast<float>(std::max(n, size_t(4))));
 
-    // Small dataset: single threshold
-    if (max_thresh <= thresh_min) {
-        return fit_gpd(sorted_abs_resid, n, thresh_min, min_tail);
-    }
+    EVTState best = fit_gpd(sorted_abs_resid, n, thresh, min_tail);
 
-    constexpr size_t MAX_THRESH = 8;
-    size_t n_thresh = std::clamp(
-        static_cast<size_t>(std::ceil(std::sqrt(
-            std::log2(std::max(static_cast<float>(n), 64.0f))))),
-        size_t(3), MAX_THRESH);
-
-    float thresholds[MAX_THRESH];
-    for (size_t t = 0; t < n_thresh; ++t) {
-        thresholds[t] = thresh_min +
-            (max_thresh - thresh_min) * static_cast<float>(t) /
-            static_cast<float>(n_thresh - 1);
-    }
-    size_t N_THRESH = n_thresh;
-
-    EVTState fits[MAX_THRESH];
-    bool valid[MAX_THRESH] = {};
-    size_t n_valid = 0;
-
-    for (size_t t = 0; t < N_THRESH; ++t) {
-        fits[t] = fit_gpd(sorted_abs_resid, n, thresholds[t], min_tail);
-        if (fits[t].fitted) {
-            valid[t] = true;
-            n_valid++;
-        }
-    }
-
-    if (n_valid < 2) {
-        for (size_t t = 0; t < N_THRESH; ++t) {
-            if (valid[t]) return fits[t];
-        }
-        return EVTState{};
-    }
-
-    size_t best_idx = 0;
-    float best_score = std::numeric_limits<float>::max();
-    bool found_best = false;
-
-    for (size_t t = 0; t < N_THRESH; ++t) {
-        if (!valid[t]) continue;
-
-        float score = 0.0f;
-        int neighbors = 0;
-
-        for (size_t p = t; p > 0; --p) {
-            if (valid[p - 1]) {
-                float dxi = fits[t].xi - fits[p - 1].xi;
-                float beta_avg = 0.5f * (fits[t].beta + fits[p - 1].beta);
-                float dbeta = (fits[t].beta - fits[p - 1].beta) /
-                    std::max(beta_avg, constants::kGpdBetaMin);
-                score += dxi * dxi + dbeta * dbeta;
-                neighbors++;
-                break;
-            }
-        }
-        for (size_t nx = t + 1; nx < N_THRESH; ++nx) {
-            if (valid[nx]) {
-                float dxi = fits[t].xi - fits[nx].xi;
-                float beta_avg = 0.5f * (fits[t].beta + fits[nx].beta);
-                float dbeta = (fits[t].beta - fits[nx].beta) /
-                    std::max(beta_avg, constants::kGpdBetaMin);
-                score += dxi * dxi + dbeta * dbeta;
-                neighbors++;
-                break;
-            }
-        }
-
-        if (neighbors > 0) {
-            score /= static_cast<float>(neighbors);
-            if (score < best_score) {
-                best_score = score;
-                best_idx = t;
-                found_best = true;
-            }
-        }
-    }
-
-    if (!found_best) {
-        for (size_t t = 0; t < N_THRESH; ++t) {
-            if (valid[t]) {
-                best_idx = t;
-                found_best = true;
-                break;
-            }
-        }
-        if (!found_best) return EVTState{};
-    }
-
-    // Validate GPD fit quality via KS test
-    EVTState& best = fits[best_idx];
-    if (best.fitted && best.n_tail >= 20) {
+    if (best.fitted && best.n_tail >= min_tail) {
         size_t u_idx = static_cast<size_t>(
-            static_cast<float>(n) * thresholds[best_idx]);
+            static_cast<float>(n) * thresh);
         u_idx = std::min(u_idx, n - 1);
         std::vector<float> sorted_tail;
         sorted_tail.reserve(n - u_idx);
@@ -350,7 +245,7 @@ inline EVTState fit_gpd_stable(const float* sorted_abs_resid, size_t n,
         }
     }
 
-    return fits[best_idx];
+    return best;
 }
 
 }

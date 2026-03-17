@@ -3,13 +3,9 @@
 #include <pybind11/stl.h>
 
 #include <cphnsw/api/hnsw_index.hpp>
-#include <cphnsw/core/adaptive_defaults.hpp>
-#include <cphnsw/core/constants.hpp>
-#include <cphnsw/core/util.hpp>
 
 #include <limits>
 #include <memory>
-#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -27,7 +23,6 @@ public:
 
     virtual size_t size() const = 0;
     virtual size_t dim() const = 0;
-    virtual bool is_finalized() const = 0;
 
     virtual std::vector<SearchResult>
     search_raw(const float* query, size_t k) const = 0;
@@ -55,7 +50,6 @@ public:
 
     size_t size() const override { return index_->size(); }
     size_t dim() const override { return index_->dim(); }
-    bool is_finalized() const override { return index_->is_finalized(); }
 
     std::vector<SearchResult>
     search_raw(const float* query, size_t k) const override {
@@ -90,11 +84,7 @@ static std::unique_ptr<PyIndexBase> create_index_with_bits(size_t dim) {
         CASE_DIM(512)
         CASE_DIM(1024)
         CASE_DIM(2048)
-        default:
-            throw std::invalid_argument(
-                "Unsupported dimension " + std::to_string(dim) +
-                " (padded to " + std::to_string(pd) +
-                "). Supported padded dims: 16, 32, 64, 128, 256, 512, 1024, 2048.");
+        default: __builtin_unreachable();
     }
 
 #undef CASE_DIM
@@ -105,10 +95,7 @@ static std::unique_ptr<PyIndexBase> create_index(size_t dim, size_t bits) {
         case 1: return create_index_with_bits<1>(dim);
         case 2: return create_index_with_bits<2>(dim);
         case 4: return create_index_with_bits<4>(dim);
-        default:
-            throw std::invalid_argument(
-                "Unsupported bits=" + std::to_string(bits) +
-                ". Supported: 1, 2, 4.");
+        default: __builtin_unreachable();
     }
 }
 
@@ -125,32 +112,23 @@ PYBIND11_MODULE(_core, m) {
         .def("build", [](PyIndexBase& self,
                           py::array_t<float, py::array::c_style | py::array::forcecast> vectors) {
             auto vbuf = vectors.request();
-            if (vbuf.ndim != 2 || static_cast<size_t>(vbuf.shape[1]) != self.dim()) {
-                throw std::invalid_argument("vectors must be a (n, dim) float32 array");
-            }
-
             const float* vec_ptr = static_cast<const float*>(vbuf.ptr);
             size_t n = static_cast<size_t>(vbuf.shape[0]);
 
             py::gil_scoped_release release;
             self.build(vec_ptr, n);
         },
-        py::arg("vectors"),
-        "Build/rebuild the index from vectors.")
+        py::arg("vectors"))
 
         .def("finalize", [](PyIndexBase& self) {
             py::gil_scoped_release release;
             self.finalize();
-        }, "Finalize the index and fit calibration statistics.")
+        })
 
         .def("search", [](const PyIndexBase& self,
                           py::array_t<float, py::array::c_style | py::array::forcecast> query,
                           size_t k) {
             auto buf = query.request();
-            if (buf.ndim != 1 || static_cast<size_t>(buf.shape[0]) != self.dim()) {
-                throw std::invalid_argument("query must be 1D and match index dimension");
-            }
-
             const float* ptr = static_cast<const float*>(buf.ptr);
 
             std::vector<SearchResult> results;
@@ -171,17 +149,12 @@ PYBIND11_MODULE(_core, m) {
             return std::make_pair(ids, distances);
         },
         py::arg("query"),
-        py::arg("k") = constants::kDefaultK,
-        "Search for nearest neighbors.")
+        py::arg("k") = 10)
 
         .def("search_batch", [](const PyIndexBase& self,
                                 py::array_t<float, py::array::c_style | py::array::forcecast> queries,
                                 size_t k) {
             auto buf = queries.request();
-            if (buf.ndim != 2 || static_cast<size_t>(buf.shape[1]) != self.dim()) {
-                throw std::invalid_argument("queries must be a (n, dim) array");
-            }
-
             const size_t n = static_cast<size_t>(buf.shape[0]);
             const float* ptr = static_cast<const float*>(buf.ptr);
             const size_t dim = self.dim();
@@ -194,9 +167,7 @@ PYBIND11_MODULE(_core, m) {
             {
                 py::gil_scoped_release release;
                 const int actual_threads = omp_get_max_threads();
-                const size_t omp_chunk = adaptive_defaults::omp_chunk_size(
-                    n, static_cast<size_t>(actual_threads));
-#pragma omp parallel for schedule(dynamic, omp_chunk) num_threads(actual_threads)
+#pragma omp parallel for schedule(guided) num_threads(actual_threads)
                 for (size_t i = 0; i < n; ++i) {
                     auto results = self.search_raw(ptr + i * dim, k);
                     size_t j = 0;
@@ -214,27 +185,20 @@ PYBIND11_MODULE(_core, m) {
             return std::make_pair(ids, distances);
         },
         py::arg("queries"),
-        py::arg("k") = constants::kDefaultK,
-        "Batch search for nearest neighbors.")
+        py::arg("k") = 10)
 
         .def("save", [](const PyIndexBase& self, const std::string& path) {
             py::gil_scoped_release release;
             self.save(path);
         },
-        py::arg("path"),
-        "Save the finalized index to a binary file.")
+        py::arg("path"))
 
         .def("load", [](PyIndexBase& self, const std::string& path) {
             py::gil_scoped_release release;
             self.load(path);
         },
-        py::arg("path"),
-        "Load an index from a binary file (replaces current state).")
+        py::arg("path"))
 
-        .def_property_readonly("size", &PyIndexBase::size,
-                               "Total indexed nodes.")
-        .def_property_readonly("dim", &PyIndexBase::dim,
-                               "Original input dimensionality.")
-        .def_property_readonly("is_finalized", &PyIndexBase::is_finalized,
-                               "Whether finalize() has been run.");
+        .def_property_readonly("size", &PyIndexBase::size)
+        .def_property_readonly("dim", &PyIndexBase::dim);
 }

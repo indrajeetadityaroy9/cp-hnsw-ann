@@ -1,52 +1,58 @@
-"""Dataset loaders."""
+"""Dataset loaders for ANN benchmarks via Hugging Face Hub."""
 
+import tarfile
 from pathlib import Path
 
 import numpy as np
+from huggingface_hub import hf_hub_download, list_repo_files
 
 
-FVECS_DATASETS = {
-    "sift1m": {
-        "base": "sift_base.fvecs",
-        "queries": "sift_query.fvecs",
-        "groundtruth": "sift_groundtruth.ivecs",
-    },
-    "gist1m": {
-        "base": "gist_base.fvecs",
-        "queries": "gist_query.fvecs",
-        "groundtruth": "gist_groundtruth.ivecs",
-    },
-}
-
-NPY_DATASETS = {"openai1536", "msmarco10m"}
-
-ALL_DATASETS = list(FVECS_DATASETS.keys()) + sorted(NPY_DATASETS)
+def _download(repo_id, filename):
+    return Path(hf_hub_download(repo_id, filename, repo_type="dataset"))
 
 
-def load_dataset(name: str, base_dir: Path) -> dict:
-    base_path = base_dir / name
+def _load_fvecs(path):
+    raw = np.fromfile(path, dtype=np.float32)
+    dim = raw[:1].view(np.int32)[0]
+    return raw.reshape(-1, dim + 1)[:, 1:].copy()
 
-    if name in FVECS_DATASETS:
-        files = FVECS_DATASETS[name]
-        base_raw = np.fromfile(base_path / files["base"], dtype=np.float32)
-        base_dim = base_raw[:1].view(np.int32)[0]
-        base = base_raw.reshape(-1, base_dim + 1)[:, 1:].copy()
 
-        query_raw = np.fromfile(base_path / files["queries"], dtype=np.float32)
-        query_dim = query_raw[:1].view(np.int32)[0]
-        queries = query_raw.reshape(-1, query_dim + 1)[:, 1:].copy()
+def _load_ivecs(path):
+    raw = np.fromfile(path, dtype=np.int32)
+    k = int(raw[0])
+    return raw.reshape(-1, k + 1)[:, 1:].copy()
 
-        gt_raw = np.fromfile(base_path / files["groundtruth"], dtype=np.int32)
-        gt_k = int(gt_raw[0])
-        groundtruth = gt_raw.reshape(-1, gt_k + 1)[:, 1:].copy()
+
+def _extract(archive_path, suffix):
+    extract_dir = archive_path.parent / "extracted"
+    extract_dir.mkdir(exist_ok=True)
+    with tarfile.open(archive_path, "r:gz") as tar:
+        for m in tar.getmembers():
+            if m.name.endswith(suffix):
+                target = extract_dir / Path(m.name).name
+                target.write_bytes(tar.extractfile(m).read())
+                return target
+
+
+def _find(files, suffix):
+    return next(f for f in files if f.endswith(suffix))
+
+
+def load_dataset(repo_id):
+    files = list_repo_files(repo_id, repo_type="dataset")
+
+    if any(f.endswith(".fvecs") for f in files):
+        base = _load_fvecs(_download(repo_id, _find(files, "_base.fvecs")))
+        queries = _load_fvecs(_download(repo_id, _find(files, "_query.fvecs")))
+        gt = _load_ivecs(_download(repo_id, _find(files, "_groundtruth.ivecs")))
+    elif any(f.endswith(".tar.gz") for f in files):
+        archive = _download(repo_id, _find(files, ".tar.gz"))
+        base = _load_fvecs(_extract(archive, "_base.fvecs"))
+        queries = _load_fvecs(_extract(archive, "_query.fvecs"))
+        gt = _load_ivecs(_extract(archive, "_groundtruth.ivecs"))
     else:
-        base = np.load(base_path / "base.npy").astype(np.float32)
-        queries = np.load(base_path / "queries.npy").astype(np.float32)
-        groundtruth = np.load(base_path / "groundtruth.npy").astype(np.int32)
+        base = np.load(_download(repo_id, _find(files, "base.npy")), allow_pickle=False).astype(np.float32)
+        queries = np.load(_download(repo_id, _find(files, "queries.npy")), allow_pickle=False).astype(np.float32)
+        gt = np.load(_download(repo_id, _find(files, "groundtruth.npy")), allow_pickle=False).astype(np.int32)
 
-    return {
-        "base": base,
-        "queries": queries,
-        "groundtruth": groundtruth,
-        "dim": base.shape[1],
-    }
+    return {"base": base, "queries": queries, "groundtruth": gt, "dim": base.shape[1]}
