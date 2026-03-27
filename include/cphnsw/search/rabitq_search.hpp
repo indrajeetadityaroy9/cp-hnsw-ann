@@ -122,17 +122,15 @@ struct BeamEntry {
     bool operator>(const BeamEntry& o) const { return est_distance > o.est_distance; }
 };
 
-template <size_t D, size_t R = 32, size_t BitWidth = 1>
+template <size_t D, size_t BitWidth = 1>
 std::vector<SearchResult> search(
     RaBitQQuery<D> query,
     const float* raw_query,
-    const RaBitQGraph<D, R, BitWidth>& graph,
+    const RaBitQGraph<D, BitWidth>& graph,
     size_t k,
     float gamma,
     TwoLevelVisitationTable& visited,
-    NodeId entry,
-    const float* slack_levels,
-    int num_slack_levels)
+    NodeId entry)
 {
     NodeId ep = entry;
 
@@ -154,12 +152,10 @@ std::vector<SearchResult> search(
     beam.push({ep_est, 0.0f, ep});
     visited.check_and_mark_estimated(ep, query_id);
 
-    alignas(64) uint32_t fastscan_sums[R];
-    alignas(64) uint32_t msb_sums[R];
-    alignas(64) float est_distances[R];
-    alignas(64) float lower_bounds[R];
-
-    int slack_batch_count = 0;
+    alignas(64) uint32_t fastscan_sums[GRAPH_DEGREE];
+    alignas(64) uint32_t msb_sums[GRAPH_DEGREE];
+    alignas(64) float est_distances[GRAPH_DEGREE];
+    alignas(64) float lower_bounds[GRAPH_DEGREE];
 
     while (!beam.empty()) {
         BeamEntry current;
@@ -194,11 +190,8 @@ std::vector<SearchResult> search(
         size_t n_neighbors = nb.size();
         float dist_qp_sq = exact_dist;
 
-        query.dot_slack = slack_levels[std::min(slack_batch_count, num_slack_levels - 1)];
-        ++slack_batch_count;
-
         constexpr size_t BATCH = fastscan::BATCH_SIZE;
-        size_t num_batches = (R + BATCH - 1) / BATCH;
+        size_t num_batches = (GRAPH_DEGREE + BATCH - 1) / BATCH;
 
         for (size_t batch = 0; batch < num_batches; ++batch) {
             size_t batch_start = batch * BATCH;

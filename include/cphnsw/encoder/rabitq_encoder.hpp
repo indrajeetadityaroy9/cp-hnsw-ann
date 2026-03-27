@@ -170,20 +170,22 @@ private:
 // RaBitQ Encoder
 // ============================================================
 
-template <typename Derived, size_t D>
-class RaBitQEncoderBase {
+template <size_t D, size_t BitWidth>
+class NbitRaBitQEncoder {
 public:
+    using CodeType = NbitRaBitQCode<D, BitWidth>;
     using QueryType = RaBitQQuery<D>;
-
+    static constexpr size_t DIMS = D;
+    static constexpr size_t BIT_WIDTH = BitWidth;
     static constexpr size_t NUM_SUB_SEGMENTS = num_sub_segments<D>;
+    static constexpr int K_INT = (1 << BitWidth) - 1;
+    static constexpr float K = static_cast<float>(K_INT);
 
-    explicit RaBitQEncoderBase(size_t dim,
-        uint64_t rotation_seed = 42)
+    explicit NbitRaBitQEncoder(size_t dim, uint64_t rotation_seed = 42)
         : dim_(dim)
         , rotation_(dim, rotation_seed)
         , padded_dim_(rotation_.padded_dim())
         , centroid_(dim, 0.0f) {
-
         float d_float = static_cast<float>(D);
         norm_factor_ = 1.0f / (d_float * std::sqrt(d_float));
         inv_sqrt_d_ = 1.0f / std::sqrt(d_float);
@@ -203,8 +205,8 @@ public:
         }
     }
 
-    template <typename CodeType>
-    void encode_batch(const float* vecs, size_t num_vecs, CodeType* codes) {
+    template <typename CT>
+    void encode_batch(const float* vecs, size_t num_vecs, CT* codes) {
         compute_centroid(vecs, num_vecs);
 
         #pragma omp parallel
@@ -214,7 +216,7 @@ public:
 
             #pragma omp for schedule(static)
             for (size_t i = 0; i < num_vecs; ++i) {
-                codes[i] = static_cast<const Derived*>(this)->encode_impl(
+                codes[i] = encode_impl(
                     vecs + i * dim_, buf.data(), centered.data());
             }
         }
@@ -286,7 +288,79 @@ public:
     const std::vector<float>& get_centroid() const { return centroid_; }
     void set_centroid(std::vector<float> c) { centroid_ = std::move(c); }
 
-protected:
+    std::pair<NbitCodeStorage<D, BitWidth>, VertexAuxData> compute_neighbor_aux_nbit(
+        const float* parent_vec, const float* neighbor_vec,
+        const float* rotated_parent) const
+    {
+        NbitCodeStorage<D, BitWidth> result_code;
+        VertexAuxData result_aux;
+        result_code.clear();
+
+        alignas(64) float diff[D];
+        float nop_sq = 0.0f;
+        for (size_t i = 0; i < dim_; ++i) {
+            diff[i] = neighbor_vec[i] - parent_vec[i];
+            nop_sq += diff[i] * diff[i];
+        }
+        for (size_t i = dim_; i < D; ++i) diff[i] = 0.0f;
+
+        float nop = std::sqrt(nop_sq);
+        result_aux.nop = nop;
+
+        float inv_nop = 1.0f / nop;
+        for (size_t i = 0; i < D; ++i) diff[i] *= inv_nop;
+
+        alignas(64) float rotated[D];
+        rotation_.apply_copy(diff, rotated);
+#ifdef __AVX512F__
+        { __m512 vnf = _mm512_set1_ps(norm_factor_);
+        for (size_t i = 0; i < padded_dim_; i += 16)
+            _mm512_storeu_ps(rotated + i, _mm512_mul_ps(_mm512_loadu_ps(rotated + i), vnf)); }
+#else
+        { __m256 vnf = _mm256_set1_ps(norm_factor_);
+        for (size_t i = 0; i < padded_dim_; i += 8)
+            _mm256_storeu_ps(rotated + i, _mm256_mul_ps(_mm256_loadu_ps(rotated + i), vnf)); }
+#endif
+
+        float ip_cp = 0.0f;
+        result_aux.ip_qo = caq_quantize(rotated, result_code,
+                                         rotated_parent, &ip_cp);
+        result_aux.ip_cp = ip_cp;
+        return {std::move(result_code), result_aux};
+    }
+
+    CodeType encode_impl(const float* vec, float* buf, float* centered_buf) const {
+        CodeType code;
+        code.clear();
+
+        float norm_sq = 0.0f;
+        for (size_t i = 0; i < dim_; ++i) {
+            float v = vec[i] - centroid_[i];
+            centered_buf[i] = v;
+            norm_sq += v * v;
+        }
+        float norm = std::sqrt(norm_sq);
+        code.nop = norm;
+
+        float inv_norm = 1.0f / norm;
+        for (size_t i = 0; i < dim_; ++i) centered_buf[i] *= inv_norm;
+
+        rotation_.apply_copy(centered_buf, buf);
+#ifdef __AVX512F__
+        { __m512 vnf = _mm512_set1_ps(norm_factor_);
+        for (size_t i = 0; i < padded_dim_; i += 16)
+            _mm512_storeu_ps(buf + i, _mm512_mul_ps(_mm512_loadu_ps(buf + i), vnf)); }
+#else
+        { __m256 vnf = _mm256_set1_ps(norm_factor_);
+        for (size_t i = 0; i < padded_dim_; i += 8)
+            _mm256_storeu_ps(buf + i, _mm256_mul_ps(_mm256_loadu_ps(buf + i), vnf)); }
+#endif
+
+        code.ip_qo = caq_quantize(buf, code.codes);
+        return code;
+    }
+
+private:
     size_t dim_;
     RandomHadamardRotation rotation_;
     size_t padded_dim_;
@@ -294,7 +368,6 @@ protected:
     float inv_sqrt_d_;
     std::vector<float> centroid_;
 
-private:
     QueryType encode_query_raw_impl(const float* vec, float* buf,
                                      uint8_t* q_bar_u) const {
         QueryType query;
@@ -314,104 +387,12 @@ private:
 
         return query;
     }
-};
 
-
-template <size_t D, size_t BitWidth>
-class NbitRaBitQEncoder : public RaBitQEncoderBase<NbitRaBitQEncoder<D, BitWidth>, D> {
-    using Base = RaBitQEncoderBase<NbitRaBitQEncoder<D, BitWidth>, D>;
-    friend Base;
-
-public:
-    using CodeType = NbitRaBitQCode<D, BitWidth>;
-    using QueryType = RaBitQQuery<D>;
-    static constexpr size_t DIMS = D;
-    static constexpr size_t BIT_WIDTH = BitWidth;
-    static constexpr int K_INT = (1 << BitWidth) - 1;
-    static constexpr float K = static_cast<float>(K_INT);
-
-    using Base::Base;
-
-
-    std::pair<NbitCodeStorage<D, BitWidth>, VertexAuxData> compute_neighbor_aux_nbit(
-        const float* parent_vec, const float* neighbor_vec,
-        const float* rotated_parent) const
-    {
-        NbitCodeStorage<D, BitWidth> result_code;
-        VertexAuxData result_aux;
-        result_code.clear();
-
-        alignas(64) float diff[D];
-        float nop_sq = 0.0f;
-        for (size_t i = 0; i < this->dim_; ++i) {
-            diff[i] = neighbor_vec[i] - parent_vec[i];
-            nop_sq += diff[i] * diff[i];
-        }
-        for (size_t i = this->dim_; i < D; ++i) diff[i] = 0.0f;
-
-        float nop = std::sqrt(nop_sq);
-        result_aux.nop = nop;
-
-        float inv_nop = 1.0f / nop;
-        for (size_t i = 0; i < D; ++i) diff[i] *= inv_nop;
-
-        alignas(64) float rotated[D];
-        this->rotation_.apply_copy(diff, rotated);
-#ifdef __AVX512F__
-        { __m512 vnf = _mm512_set1_ps(this->norm_factor_);
-        for (size_t i = 0; i < this->padded_dim_; i += 16)
-            _mm512_storeu_ps(rotated + i, _mm512_mul_ps(_mm512_loadu_ps(rotated + i), vnf)); }
-#else
-        { __m256 vnf = _mm256_set1_ps(this->norm_factor_);
-        for (size_t i = 0; i < this->padded_dim_; i += 8)
-            _mm256_storeu_ps(rotated + i, _mm256_mul_ps(_mm256_loadu_ps(rotated + i), vnf)); }
-#endif
-
-        float ip_cp = 0.0f;
-        result_aux.ip_qo = caq_quantize(rotated, result_code,
-                                         rotated_parent, &ip_cp);
-        result_aux.ip_cp = ip_cp;
-        return {std::move(result_code), result_aux};
-    }
-
-
-    CodeType encode_impl(const float* vec, float* buf, float* centered_buf) const {
-        CodeType code;
-        code.clear();
-
-        float norm_sq = 0.0f;
-        for (size_t i = 0; i < this->dim_; ++i) {
-            float v = vec[i] - this->centroid_[i];
-            centered_buf[i] = v;
-            norm_sq += v * v;
-        }
-        float norm = std::sqrt(norm_sq);
-        code.nop = norm;
-
-        float inv_norm = 1.0f / norm;
-        for (size_t i = 0; i < this->dim_; ++i) centered_buf[i] *= inv_norm;
-
-        this->rotation_.apply_copy(centered_buf, buf);
-#ifdef __AVX512F__
-        { __m512 vnf = _mm512_set1_ps(this->norm_factor_);
-        for (size_t i = 0; i < this->padded_dim_; i += 16)
-            _mm512_storeu_ps(buf + i, _mm512_mul_ps(_mm512_loadu_ps(buf + i), vnf)); }
-#else
-        { __m256 vnf = _mm256_set1_ps(this->norm_factor_);
-        for (size_t i = 0; i < this->padded_dim_; i += 8)
-            _mm256_storeu_ps(buf + i, _mm256_mul_ps(_mm256_loadu_ps(buf + i), vnf)); }
-#endif
-
-        code.ip_qo = caq_quantize(buf, code.codes);
-        return code;
-    }
-
-private:
     float caq_quantize(const float* rotated_buf,
                        NbitCodeStorage<D, BitWidth>& out_code,
                        const float* rotated_parent = nullptr,
                        float* out_ip_cp = nullptr) const {
-        const size_t pd = this->padded_dim_;
+        const size_t pd = padded_dim_;
 
         float buf_min = rotated_buf[0], buf_max = rotated_buf[0];
         for (size_t i = 1; i < pd; ++i) {
@@ -494,8 +475,8 @@ private:
             ip_qo += c * rotated_buf[i];
             if (rotated_parent) ip_cp += c * rotated_parent[i];
         }
-        if (out_ip_cp) *out_ip_cp = ip_cp * this->inv_sqrt_d_;
-        return ip_qo * this->inv_sqrt_d_;
+        if (out_ip_cp) *out_ip_cp = ip_cp * inv_sqrt_d_;
+        return ip_qo * inv_sqrt_d_;
     }
 };
 

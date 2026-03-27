@@ -41,13 +41,7 @@ std::vector<SearchResult> select_neighbors_alpha_cng(
 
     if (candidates.size() <= R) return candidates;
 
-    float local_alpha = alpha * std::sqrt(
-        static_cast<float>(candidates.size()) / static_cast<float>(R));
-    if (alpha_max > 0.0f) {
-        local_alpha = std::clamp(local_alpha, 1.0f, alpha_max);
-    } else {
-        local_alpha = std::max(local_alpha, 1.0f);
-    }
+    float local_alpha = std::max(alpha, 1.0f);
 
     std::vector<SearchResult> selected;
     selected.reserve(R);
@@ -118,8 +112,8 @@ inline float stddev(const float* data, size_t n) {
 }
 namespace graph_refinement {
 
-template <size_t D, size_t R, size_t BitWidth, typename EncType>
-void prune_and_write(RaBitQGraph<D, R, BitWidth>& graph, const EncType& encoder,
+template <size_t D, size_t BitWidth, typename EncType>
+void prune_and_write(RaBitQGraph<D, BitWidth>& graph, const EncType& encoder,
                      NodeId node, std::vector<SearchResult>& candidates,
                      float alpha, float tau, float error_tolerance = 0.0f,
                      float alpha_max = 0.0f) {
@@ -132,7 +126,7 @@ void prune_and_write(RaBitQGraph<D, R, BitWidth>& graph, const EncType& encoder,
     };
 
     auto selected = select_neighbors_alpha_cng(
-        std::move(candidates), R, dist_fn, error_fn, alpha, tau, alpha_max);
+        std::move(candidates), GRAPH_DEGREE, dist_fn, error_fn, alpha, tau, alpha_max);
 
     auto& nb = graph.get_neighbors(node);
     nb.count = 0;
@@ -152,9 +146,9 @@ void prune_and_write(RaBitQGraph<D, R, BitWidth>& graph, const EncType& encoder,
 }
 
 
-template <size_t D, size_t R, size_t BitWidth>
+template <size_t D, size_t BitWidth>
 void init_working_random(
-    const RaBitQGraph<D, R, BitWidth>& graph,
+    const RaBitQGraph<D, BitWidth>& graph,
     std::vector<std::vector<SearchResult>>& working,
     size_t actual_threads)
 {
@@ -175,8 +169,8 @@ void init_working_random(
 
             std::vector<SearchResult> candidates;
             size_t pool_size = std::min(
-                static_cast<size_t>(static_cast<double>(R) *
-                    std::ceil(std::log(static_cast<double>(n) / static_cast<double>(R)))),
+                static_cast<size_t>(static_cast<double>(GRAPH_DEGREE) *
+                    std::ceil(std::log(static_cast<double>(n) / static_cast<double>(GRAPH_DEGREE)))),
                 n - 1);
             candidates.reserve(pool_size);
 
@@ -192,16 +186,16 @@ void init_working_random(
             }
             std::sort(candidates.begin(), candidates.end(),
                       [](const auto& a, const auto& b) { return a.distance < b.distance; });
-            size_t keep = std::min(candidates.size(), static_cast<size_t>(R));
+            size_t keep = std::min(candidates.size(), static_cast<size_t>(GRAPH_DEGREE));
             working[i].assign(candidates.begin(), candidates.begin() + keep);
         }
     }
 }
 
 
-template <size_t D, size_t R, size_t BitWidth>
+template <size_t D, size_t BitWidth>
 size_t nndescent_join_pass(
-    const RaBitQGraph<D, R, BitWidth>& graph,
+    const RaBitQGraph<D, BitWidth>& graph,
     std::vector<std::vector<SearchResult>>& working,
     std::vector<std::vector<uint8_t>>& new_flags,
     size_t actual_threads)
@@ -209,14 +203,14 @@ size_t nndescent_join_pass(
     size_t n = graph.size();
 
     struct SnapshotEntry {
-        NodeId ids[R];
-        uint8_t is_new[R];
+        NodeId ids[GRAPH_DEGREE];
+        uint8_t is_new[GRAPH_DEGREE];
         uint8_t count;
     };
     std::vector<SnapshotEntry> snapshot(n);
 
     for (size_t i = 0; i < n; ++i) {
-        size_t sz = std::min(working[i].size(), static_cast<size_t>(R));
+        size_t sz = std::min(working[i].size(), static_cast<size_t>(GRAPH_DEGREE));
         snapshot[i].count = static_cast<uint8_t>(sz);
         for (size_t j = 0; j < sz; ++j) {
             snapshot[i].ids[j] = working[i][j].id;
@@ -240,7 +234,7 @@ size_t nndescent_join_pass(
     #pragma omp parallel num_threads(actual_threads)
     {
         std::vector<NodeId> candidates;
-        candidates.reserve(R * R);
+        candidates.reserve(GRAPH_DEGREE * GRAPH_DEGREE);
 
         #pragma omp for schedule(guided)
         for (size_t i = 0; i < n; ++i) {
@@ -313,15 +307,15 @@ size_t nndescent_join_pass(
                 candidates.end());
 
             size_t local_updates = 0;
-            float worst = (wl.size() >= R)
+            float worst = (wl.size() >= GRAPH_DEGREE)
                 ? wl.back().distance
                 : std::numeric_limits<float>::max();
 
             for (NodeId w : candidates) {
                 float d = l2_distance_simd<D>(vec_u, graph.get_vector(w));
-                if (d >= worst && wl.size() >= R) continue;
+                if (d >= worst && wl.size() >= GRAPH_DEGREE) continue;
 
-                if (wl.size() < R) {
+                if (wl.size() < GRAPH_DEGREE) {
                     wl.push_back({w, d});
                     new_flags[i].push_back(1);
                 } else {
@@ -333,7 +327,7 @@ size_t nndescent_join_pass(
                     std::swap(new_flags[i][p], new_flags[i][p-1]);
                 }
 
-                worst = (wl.size() >= R) ? wl.back().distance : std::numeric_limits<float>::max();
+                worst = (wl.size() >= GRAPH_DEGREE) ? wl.back().distance : std::numeric_limits<float>::max();
                 local_updates++;
             }
 
@@ -347,9 +341,9 @@ size_t nndescent_join_pass(
 }
 
 
-template <size_t D, size_t R, size_t BitWidth>
+template <size_t D, size_t BitWidth>
 GraphStats derive_graph_stats(
-    const RaBitQGraph<D, R, BitWidth>& graph,
+    const RaBitQGraph<D, BitWidth>& graph,
     const std::vector<std::vector<SearchResult>>& working,
     size_t sample_size)
 {
@@ -365,11 +359,11 @@ GraphStats derive_graph_stats(
     std::vector<float> neighbor_dists;
     std::vector<float> inter_neighbor_dists;
     std::vector<float> nn_dists;
-    neighbor_dists.reserve(actual_sample * R);
-    inter_neighbor_dists.reserve(actual_sample * R);
+    neighbor_dists.reserve(actual_sample * GRAPH_DEGREE);
+    inter_neighbor_dists.reserve(actual_sample * GRAPH_DEGREE);
     nn_dists.reserve(actual_sample);
 
-    constexpr size_t inter_limit_val = std::min(2 * isqrt(R), R);
+    constexpr size_t inter_limit_val = std::min(2 * isqrt(GRAPH_DEGREE), GRAPH_DEGREE);
 
     for (size_t idx : sample_indices) {
         const auto& wl = working[idx];
@@ -423,8 +417,8 @@ GraphStats derive_graph_stats(
 }
 
 
-template <size_t D, size_t R, size_t BitWidth, typename EncType>
-void run_reverse_edge_pass(RaBitQGraph<D, R, BitWidth>& graph, const EncType& encoder,
+template <size_t D, size_t BitWidth, typename EncType>
+void run_reverse_edge_pass(RaBitQGraph<D, BitWidth>& graph, const EncType& encoder,
                            float alpha, float tau, float error_tolerance,
                            size_t actual_threads,
                            float alpha_max = 0.0f) {
@@ -464,14 +458,14 @@ void run_reverse_edge_pass(RaBitQGraph<D, R, BitWidth>& graph, const EncType& en
             all.push_back(cand);
         }
 
-        prune_and_write<D, R, BitWidth>(graph, encoder, v, all, alpha, tau, error_tolerance, alpha_max);
+        prune_and_write<D, BitWidth>(graph, encoder, v, all, alpha, tau, error_tolerance, alpha_max);
     }
 }
 
 
-template <size_t D, size_t R, size_t BitWidth, typename EncType>
+template <size_t D, size_t BitWidth, typename EncType>
 std::vector<NodeId>
-optimize_graph_adaptive(RaBitQGraph<D, R, BitWidth>& graph, const EncType& encoder) {
+optimize_graph_adaptive(RaBitQGraph<D, BitWidth>& graph, const EncType& encoder) {
     size_t n = graph.size();
 
     size_t actual_threads = static_cast<size_t>(omp_get_max_threads());
@@ -484,19 +478,19 @@ optimize_graph_adaptive(RaBitQGraph<D, R, BitWidth>& graph, const EncType& encod
     std::vector<std::vector<SearchResult>> working(n);
     std::vector<std::vector<uint8_t>> new_flags(n);
 
-    init_working_random<D, R, BitWidth>(graph, working, actual_threads);
+    init_working_random<D, BitWidth>(graph, working, actual_threads);
 
     for (size_t i = 0; i < n; ++i) {
         new_flags[i].assign(working[i].size(), 1);
     }
 
-    size_t total_edges = std::max(n * R, size_t(1));
+    size_t total_edges = std::max(n * GRAPH_DEGREE, size_t(1));
 
-    size_t updates_0 = nndescent_join_pass<D, R, BitWidth>(
+    size_t updates_0 = nndescent_join_pass<D, BitWidth>(
         graph, working, new_flags, actual_threads);
     float rate_0 = static_cast<float>(updates_0) / static_cast<float>(total_edges);
 
-    size_t updates_1 = nndescent_join_pass<D, R, BitWidth>(
+    size_t updates_1 = nndescent_join_pass<D, BitWidth>(
         graph, working, new_flags, actual_threads);
     float rate_1 = static_cast<float>(updates_1) / static_cast<float>(total_edges);
 
@@ -505,32 +499,20 @@ optimize_graph_adaptive(RaBitQGraph<D, R, BitWidth>& graph, const EncType& encod
     // α = 1-r is the optimal weight for a geometrically decaying process
     float ema_alpha = std::clamp(1.0f - decay_ratio, 0.0f, 1.0f);
 
-    float converge_rate = std::max(
-        rate_0 / static_cast<float>(total_edges),
-        1.0f / static_cast<float>(total_edges));
+    float converge_rate = 1.0f / static_cast<float>(total_edges);
 
     size_t min_rounds;
     if (decay_ratio > 0.0f && decay_ratio < 1.0f && rate_0 > converge_rate) {
         min_rounds = static_cast<size_t>(std::ceil(
             std::log(converge_rate / rate_0) / std::log(decay_ratio)));
-        min_rounds = std::clamp(min_rounds, size_t(2),
-            static_cast<size_t>(std::sqrt(std::log2(
-                static_cast<float>(n)))));
     } else {
         min_rounds = 2;
     }
 
-    size_t time_constant = (decay_ratio > 0.0f && decay_ratio < 1.0f)
-        ? static_cast<size_t>(std::ceil(
-            -1.0 / std::log(static_cast<double>(decay_ratio))))
-        : 1;
-    size_t hard_cap = std::max(min_rounds,
-        std::min(min_rounds + time_constant, isqrt(n)));
-
     float ema_rate = ema_alpha * rate_1 + (1.0f - ema_alpha) * rate_0;
 
-    for (size_t round = 2; round < hard_cap; ++round) {
-        size_t updates = nndescent_join_pass<D, R, BitWidth>(
+    for (size_t round = 2; ; ++round) {
+        size_t updates = nndescent_join_pass<D, BitWidth>(
             graph, working, new_flags, actual_threads);
         float rate = static_cast<float>(updates) / static_cast<float>(total_edges);
 
@@ -540,7 +522,7 @@ optimize_graph_adaptive(RaBitQGraph<D, R, BitWidth>& graph, const EncType& encod
     }
 
     size_t alpha_sample = static_cast<size_t>(std::sqrt(static_cast<double>(n)));
-    GraphStats stats = derive_graph_stats<D, R, BitWidth>(graph, working, alpha_sample);
+    GraphStats stats = derive_graph_stats<D, BitWidth>(graph, working, alpha_sample);
 
     float alpha = stats.alpha;
     float tau = stats.tau;
@@ -556,7 +538,7 @@ optimize_graph_adaptive(RaBitQGraph<D, R, BitWidth>& graph, const EncType& encod
                 candidates.push_back({nb.id, nb.distance});
             }
         }
-        prune_and_write<D, R, BitWidth>(graph, encoder, u, candidates,
+        prune_and_write<D, BitWidth>(graph, encoder, u, candidates,
             alpha, tau, error_tolerance, alpha_max);
     }
 
@@ -565,7 +547,7 @@ optimize_graph_adaptive(RaBitQGraph<D, R, BitWidth>& graph, const EncType& encod
     new_flags.clear();
     new_flags.shrink_to_fit();
 
-    run_reverse_edge_pass<D, R, BitWidth>(graph, encoder, alpha, tau,
+    run_reverse_edge_pass<D, BitWidth>(graph, encoder, alpha, tau,
         error_tolerance, actual_threads, alpha_max);
 
     NodeId hub = graph.find_hub_entry(centroid);

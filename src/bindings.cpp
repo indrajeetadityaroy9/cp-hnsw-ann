@@ -34,7 +34,7 @@ public:
 template <size_t D, size_t BitWidth>
 class PyIndexWrapper : public PyIndexBase {
 public:
-    using IndexType = Index<D, 32, BitWidth>;
+    using IndexType = Index<D, BitWidth>;
 
     explicit PyIndexWrapper(size_t dim) {
         index_ = std::make_unique<IndexType>(dim);

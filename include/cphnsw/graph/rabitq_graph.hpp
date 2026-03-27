@@ -12,25 +12,24 @@
 namespace cphnsw {
 
 
-template <size_t D, size_t R, size_t BitWidth = 1>
+template <size_t D, size_t BitWidth = 1>
 struct alignas(64) VertexSearchData {
     using CodeType = NbitRaBitQCode<D, BitWidth>;
-    using NeighborBlockType = NbitFastScanNeighborBlock<D, R, BitWidth>;
+    using NeighborBlockType = NbitFastScanNeighborBlock<D, BitWidth>;
 
     CodeType code;
     NeighborBlockType neighbors;
 };
 
-template <size_t D, size_t R = 32, size_t BitWidth = 1>
+template <size_t D, size_t BitWidth = 1>
 class RaBitQGraph {
 public:
-    using SearchDataType = VertexSearchData<D, R, BitWidth>;
+    using SearchDataType = VertexSearchData<D, BitWidth>;
     using CodeType = typename SearchDataType::CodeType;
     using NeighborBlockType = typename SearchDataType::NeighborBlockType;
     using RawVector = std::array<float, D>;
 
     static constexpr size_t DIMS = D;
-    static constexpr size_t DEGREE = R;
 
     explicit RaBitQGraph(size_t dim, size_t capacity = 1024)
         : dim_(dim) {
@@ -200,7 +199,7 @@ public:
 
         for (size_t i = 0; i < n; ++i) {
             auto& nb = new_search[i].neighbors;
-            for (size_t j = 0; j < R; ++j) {
+            for (size_t j = 0; j < GRAPH_DEGREE; ++j) {
                 NodeId old_nid = nb.neighbor_ids[j];
                 if (old_nid != INVALID_NODE) {
                     nb.neighbor_ids[j] = perm[old_nid];

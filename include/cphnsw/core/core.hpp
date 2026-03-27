@@ -18,6 +18,7 @@ namespace cphnsw {
 
 using NodeId = uint32_t;
 constexpr NodeId INVALID_NODE = 0xFFFFFFFF;
+inline constexpr size_t GRAPH_DEGREE = 32;
 
 struct SearchResult {
     NodeId id;
@@ -251,9 +252,6 @@ struct RaBitQQuery {
     float coeff_popcount;
     float coeff_constant;
 
-    float affine_a = 1.0f;
-    float affine_b = 0.0f;
-    float ip_qo_floor = 0.0f;
     float dot_slack = 0.0f;
 };
 
