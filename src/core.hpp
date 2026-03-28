@@ -10,10 +10,6 @@
 
 namespace cphnsw {
 
-// ============================================================
-// Types
-// ============================================================
-
 using NodeId = uint32_t;
 constexpr NodeId INVALID_NODE = 0xFFFFFFFF;
 inline constexpr size_t GRAPH_DEGREE = 32;
@@ -31,18 +27,10 @@ struct SearchResult {
     }
 };
 
-// ============================================================
-// Utility
-// ============================================================
-
 inline size_t next_power_of_two(size_t n) {
     if (n <= 1) return 1;
     return size_t(1) << (64 - __builtin_clzll(n - 1));
 }
-
-// ============================================================
-// Memory
-// ============================================================
 
 constexpr size_t CACHE_LINE_SIZE = 64;
 constexpr size_t SIMD_ALIGNMENT = 64;
@@ -187,10 +175,6 @@ inline float dot_product_simd(const float* __restrict__ a, const float* __restri
     return hsum256(_mm256_add_ps(_mm256_add_ps(sum0, sum1), _mm256_add_ps(sum2, sum3)));
 #endif
 }
-
-// ============================================================
-// Codes
-// ============================================================
 
 template <size_t D>
 constexpr size_t num_sub_segments = (D + 3) / 4;
