@@ -32,6 +32,13 @@ template <size_t D>
 std::vector<Segment> compute_segmentation(
     const float* per_dim_variance, size_t total_bit_budget)
 {
+    // D < SEGMENT_ALIGN: entire dimension set fits in one uint64_t word.
+    // DP cannot subdivide, so return a single uniform segment.
+    if constexpr (D < SEGMENT_ALIGN) {
+        size_t bits = total_bit_budget / D;
+        return {{0, D, bits}};
+    }
+
     // Prefix sums of variance for O(1) range queries
     std::vector<float> prefix_var(D + 1, 0.0f);
     for (size_t i = 0; i < D; ++i) {

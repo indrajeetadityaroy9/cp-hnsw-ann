@@ -101,6 +101,8 @@ public:
 
         uint64_t hdr_n = static_cast<uint64_t>(graph_.size());
         write_raw(&hdr_n, sizeof(hdr_n));
+        NodeId ep = graph_.entry_point();
+        write_raw(&ep, sizeof(ep));
         write_raw(&calibration_, sizeof(CalibrationSnapshot));
 
         const auto& centroid = encoder_.get_centroid();
@@ -132,6 +134,8 @@ public:
 
         uint64_t hdr_n;
         read_raw(&hdr_n, sizeof(hdr_n));
+        NodeId ep;
+        read_raw(&ep, sizeof(ep));
 
         CalibrationSnapshot new_calib;
         read_raw(&new_calib, sizeof(CalibrationSnapshot));
@@ -160,7 +164,7 @@ public:
             std::move(new_search_data),
             std::move(new_raw_vectors),
             std::move(new_norm_sq),
-            graph_.entry_point());
+            ep);
 
         encoder_.set_centroid(std::move(new_centroid));
         calibration_ = new_calib;

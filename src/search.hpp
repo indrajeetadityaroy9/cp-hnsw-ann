@@ -12,7 +12,7 @@
 namespace cphnsw {
 
 // ============================================================
-// Two-Level Visitation Table (formerly visitation_table.hpp)
+// Two-Level Visitation Table
 // ============================================================
 
 class TwoLevelVisitationTable {

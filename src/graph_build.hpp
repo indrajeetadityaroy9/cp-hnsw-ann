@@ -15,7 +15,7 @@
 namespace cphnsw {
 
 // ============================================================
-// Neighbor Selection (formerly neighbor_selection.hpp)
+// Neighbor Selection
 // ============================================================
 
 template <typename DistanceFn, typename ErrorFn>

@@ -11,7 +11,7 @@
 namespace cphnsw {
 
 // ============================================================
-// Types (formerly types.hpp)
+// Types
 // ============================================================
 
 using NodeId = uint32_t;
@@ -32,7 +32,7 @@ struct SearchResult {
 };
 
 // ============================================================
-// Utility (formerly util.hpp)
+// Utility
 // ============================================================
 
 inline size_t next_power_of_two(size_t n) {
@@ -41,7 +41,7 @@ inline size_t next_power_of_two(size_t n) {
 }
 
 // ============================================================
-// Memory (formerly memory.hpp)
+// Memory
 // ============================================================
 
 constexpr size_t CACHE_LINE_SIZE = 64;
@@ -189,7 +189,7 @@ inline float dot_product_simd(const float* __restrict__ a, const float* __restri
 }
 
 // ============================================================
-// Codes (formerly codes.hpp)
+// Codes
 // ============================================================
 
 template <size_t D>

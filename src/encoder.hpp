@@ -16,7 +16,7 @@
 namespace cphnsw {
 
 // ============================================================
-// Fast Hadamard Transform (formerly transform/fht.hpp)
+// Fast Hadamard Transform
 // ============================================================
 
 inline void fht(float* vec, size_t len) {
@@ -102,7 +102,7 @@ inline void fht(float* vec, size_t len) {
 }
 
 // ============================================================
-// Random Hadamard Rotation (formerly rotation.hpp)
+// Random Hadamard Rotation
 // ============================================================
 
 class RandomHadamardRotation {
