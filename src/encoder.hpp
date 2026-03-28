@@ -1,6 +1,7 @@
 #pragma once
 
-#include "../core/core.hpp"
+#include "core.hpp"
+#include "segmentation.hpp"
 #include <array>
 #include <climits>
 #include <cmath>
@@ -189,6 +190,11 @@ public:
         float d_float = static_cast<float>(D);
         norm_factor_ = 1.0f / (d_float * std::sqrt(d_float));
         inv_sqrt_d_ = 1.0f / std::sqrt(d_float);
+        // Initialize with uniform bit allocation (pre-segmentation)
+        for (size_t i = 0; i < D; ++i) {
+            k_int_[i] = K_INT;
+            k_float_[i] = K;
+        }
     }
 
     void compute_centroid(const float* vecs, size_t num_vecs) {
@@ -208,6 +214,7 @@ public:
     template <typename CT>
     void encode_batch(const float* vecs, size_t num_vecs, CT* codes) {
         compute_centroid(vecs, num_vecs);
+        compute_segmentation_from_data(vecs, num_vecs);
 
         #pragma omp parallel
         {
@@ -222,12 +229,28 @@ public:
         }
     }
 
+    const std::vector<Segment>& get_segments() const { return segments_; }
+    const std::array<float, D>& get_dim_variance() const { return dim_variance_; }
+
     QueryType encode_query_raw(const float* vec) const {
         thread_local AlignedVector<float> buf(padded_dim_);
         thread_local AlignedVector<uint8_t> q_bar_u(padded_dim_);
         buf.resize(padded_dim_);
         q_bar_u.resize(padded_dim_);
-        return encode_query_raw_impl(vec, buf.data(), q_bar_u.data());
+
+        QueryType query;
+        rotation_.apply_copy(vec, buf.data());
+#ifdef __AVX512F__
+        { __m512 vnf = _mm512_set1_ps(norm_factor_);
+        for (size_t i = 0; i < padded_dim_; i += 16)
+            _mm512_storeu_ps(buf.data() + i, _mm512_mul_ps(_mm512_loadu_ps(buf.data() + i), vnf)); }
+#else
+        { __m256 vnf = _mm256_set1_ps(norm_factor_);
+        for (size_t i = 0; i < padded_dim_; i += 8)
+            _mm256_storeu_ps(buf.data() + i, _mm256_mul_ps(_mm256_loadu_ps(buf.data() + i), vnf)); }
+#endif
+        build_lut(buf.data(), q_bar_u.data(), query);
+        return query;
     }
 
     void rotate_raw_vector(const float* vec, float* out) const {
@@ -367,25 +390,46 @@ private:
     float norm_factor_;
     float inv_sqrt_d_;
     std::vector<float> centroid_;
+    std::vector<Segment> segments_;
+    std::array<float, D> dim_variance_{};
+    std::array<int, D> k_int_;
+    std::array<float, D> k_float_;
 
-    QueryType encode_query_raw_impl(const float* vec, float* buf,
-                                     uint8_t* q_bar_u) const {
-        QueryType query;
+    void compute_segmentation_from_data(const float* vecs, size_t num_vecs) {
+        alignas(64) float var[D] = {};
+        AlignedVector<float> buf(padded_dim_);
+        std::vector<float> centered(dim_);
 
-        rotation_.apply_copy(vec, buf);
-#ifdef __AVX512F__
-        { __m512 vnf = _mm512_set1_ps(norm_factor_);
-        for (size_t i = 0; i < padded_dim_; i += 16)
-            _mm512_storeu_ps(buf + i, _mm512_mul_ps(_mm512_loadu_ps(buf + i), vnf)); }
-#else
-        { __m256 vnf = _mm256_set1_ps(norm_factor_);
-        for (size_t i = 0; i < padded_dim_; i += 8)
-            _mm256_storeu_ps(buf + i, _mm256_mul_ps(_mm256_loadu_ps(buf + i), vnf)); }
-#endif
+        for (size_t i = 0; i < num_vecs; ++i) {
+            float norm_sq = 0.0f;
+            for (size_t j = 0; j < dim_; ++j) {
+                float v = vecs[i * dim_ + j] - centroid_[j];
+                centered[j] = v;
+                norm_sq += v * v;
+            }
+            float inv_norm = 1.0f / std::sqrt(norm_sq);
+            for (size_t j = 0; j < dim_; ++j) centered[j] *= inv_norm;
 
-        build_lut(buf, q_bar_u, query);
+            rotation_.apply_copy(centered.data(), buf.data());
+            for (size_t j = 0; j < padded_dim_; ++j) buf[j] *= norm_factor_;
 
-        return query;
+            for (size_t j = 0; j < D; ++j) var[j] += buf[j] * buf[j];
+        }
+
+        float inv_n = 1.0f / static_cast<float>(num_vecs);
+        for (size_t j = 0; j < D; ++j) {
+            var[j] *= inv_n;
+            dim_variance_[j] = var[j];
+        }
+
+        segments_ = compute_segmentation<D>(var, BitWidth * D);
+
+        for (const auto& seg : segments_) {
+            for (size_t i = seg.start; i < seg.start + seg.len; ++i) {
+                k_int_[i] = (1 << seg.bits) - 1;
+                k_float_[i] = static_cast<float>(k_int_[i]);
+            }
+        }
     }
 
     float caq_quantize(const float* rotated_buf,
@@ -399,20 +443,21 @@ private:
             if (rotated_buf[i] < buf_min) buf_min = rotated_buf[i];
             if (rotated_buf[i] > buf_max) buf_max = rotated_buf[i];
         }
-        float delta = (buf_max - buf_min) / K;
-        float inv_delta = 1.0f / delta;
+        float range = buf_max - buf_min;
+        float inv_range = 1.0f / range;
 
         thread_local std::vector<int> codes_arr;
         codes_arr.resize(pd);
 
         float dot_co = 0.0f, norm_c_sq = 0.0f;
         for (size_t i = 0; i < pd; ++i) {
-            float val = (rotated_buf[i] - buf_min) * inv_delta;
+            float kf = k_float_[i];
+            float val = (rotated_buf[i] - buf_min) * inv_range * kf;
             int u = static_cast<int>(val + 0.5f);
             if (u < 0) u = 0;
-            if (u > K_INT) u = K_INT;
+            if (u > k_int_[i]) u = k_int_[i];
             codes_arr[i] = u;
-            float c = (2.0f * u - K) / K;
+            float c = (2.0f * u - kf) / kf;
             dot_co += c * rotated_buf[i];
             norm_c_sq += c * c;
         }
@@ -421,17 +466,21 @@ private:
         for (size_t iter = 0; ; ++iter) {
             bool changed = false;
             for (size_t i = 0; i < pd; ++i) {
+                float kf = k_float_[i];
+                int ki = k_int_[i];
                 int old_u = codes_arr[i];
-                float old_c = (2.0f * old_u - K) / K;
+                float old_c = (2.0f * old_u - kf) / kf;
                 float dot_without = dot_co - old_c * rotated_buf[i];
                 float norm_without = norm_c_sq - old_c * old_c;
                 int best_u = old_u;
                 float best_dot = dot_co, best_norm = norm_c_sq;
-                if constexpr (BitWidth >= 4) {
-                    for (int delta : {-1, +1}) {
-                        int u_try = old_u + delta;
-                        if (u_try < 0 || u_try > K_INT) continue;
-                        float c = (2.0f * u_try - K) / K;
+                // K for the largest allowed bit width; delta search above, exhaustive below
+                constexpr int DELTA_SEARCH_K = (1 << ALLOWED_BITS[NUM_ALLOWED_BITS - 1]) - 1;
+                if (ki >= DELTA_SEARCH_K) {
+                    for (int d : {-1, +1}) {
+                        int u_try = old_u + d;
+                        if (u_try < 0 || u_try > ki) continue;
+                        float c = (2.0f * u_try - kf) / kf;
                         float new_dot = dot_without + c * rotated_buf[i];
                         float new_norm = norm_without + c * c;
                         if (new_dot * new_dot * best_norm > best_dot * best_dot * new_norm) {
@@ -441,9 +490,10 @@ private:
                         }
                     }
                 } else {
-                    for (int u = 0; u <= K_INT; ++u) {
+                    // 1-2 bit: exhaustive search
+                    for (int u = 0; u <= ki; ++u) {
                         if (u == old_u) continue;
-                        float c = (2.0f * u - K) / K;
+                        float c = (2.0f * u - kf) / kf;
                         float new_dot = dot_without + c * rotated_buf[i];
                         float new_norm = norm_without + c * c;
                         if (new_dot * new_dot * best_norm > best_dot * best_dot * new_norm) {
@@ -454,7 +504,7 @@ private:
                     }
                 }
                 if (best_u != old_u) {
-                    float new_c = (2.0f * best_u - K) / K;
+                    float new_c = (2.0f * best_u - kf) / kf;
                     dot_co = dot_without + new_c * rotated_buf[i];
                     norm_c_sq = norm_without + new_c * new_c;
                     codes_arr[i] = best_u;
@@ -462,7 +512,7 @@ private:
                 }
             }
             if (!changed) break;
-            float cos_sq = (norm_c_sq > 0.0f) ? (dot_co * dot_co / norm_c_sq) : 0.0f;
+            float cos_sq = dot_co * dot_co / norm_c_sq;
             if (iter > 0 && (cos_sq - prev_cos_sq) < 1.0f / (K * K)) break;
             prev_cos_sq = cos_sq;
         }
@@ -470,8 +520,9 @@ private:
         float ip_qo = 0.0f;
         float ip_cp = 0.0f;
         for (size_t i = 0; i < pd; ++i) {
+            float kf = k_float_[i];
             out_code.set_value(i, static_cast<uint8_t>(codes_arr[i]));
-            float c = (2.0f * codes_arr[i] - K) / K;
+            float c = (2.0f * codes_arr[i] - kf) / kf;
             ip_qo += c * rotated_buf[i];
             if (rotated_parent) ip_cp += c * rotated_parent[i];
         }

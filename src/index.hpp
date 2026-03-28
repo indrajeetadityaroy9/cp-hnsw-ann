@@ -1,14 +1,12 @@
 #pragma once
 
-#include "../core/core.hpp"
-#include "../distance/fastscan_kernel.hpp"
-#include "../encoder/rabitq_encoder.hpp"
-#include "../graph/rabitq_graph.hpp"
-#include "../graph/graph_refinement.hpp"
-#include "../search/rabitq_search.hpp"
+#include "core.hpp"
+#include "encoder.hpp"
+#include "graph.hpp"
+#include "graph_build.hpp"
+#include "search.hpp"
 #include <vector>
 #include <cmath>
-#include <algorithm>
 #include <mutex>
 #include <shared_mutex>
 #include <cstring>
@@ -36,7 +34,7 @@ public:
 
     explicit Index(size_t dim)
         : dim_(dim)
-        , encoder_(dim, 42)
+        , encoder_(dim, static_cast<uint64_t>(dim) * D)
         , graph_(dim)
     {}
 
@@ -177,15 +175,30 @@ private:
 
     void compute_analytic_bounds() {
         float sigma_ratio = std::sqrt(static_cast<float>(M_PI) / 2.0f - 1.0f);
-        float sqrt_D = std::sqrt(static_cast<float>(D));
-        float epsilon_B = sigma_ratio / (static_cast<float>(1 << BitWidth) * sqrt_D);
-        float gamma = 2.0f * (1.0f - epsilon_B);
-        calibration_.gamma_eff = (1.0f + gamma) * (1.0f + epsilon_B) / (1.0f - epsilon_B) - 1.0f;
-        if constexpr (BitWidth >= 2) {
-            calibration_.dot_slack = sigma_ratio / sqrt_D;
-        } else {
-            calibration_.dot_slack = 0.0f;
+        float D_f = static_cast<float>(D);
+
+        // Segmentation-aware epsilon (E3):
+        // epsilon_seg = sigma_ratio * sqrt(sum_s sum_{j in Seg_s} V_j / 4^{B_s}) / D
+        const auto& segments = encoder_.get_segments();
+        const auto& var = encoder_.get_dim_variance();
+        float weighted_sum = 0.0f;
+        float max_seg_weight = 0.0f;
+        for (const auto& seg : segments) {
+            float scale = 1.0f;
+            for (size_t b = 0; b < seg.bits; ++b) scale *= 4.0f;
+            float seg_var_sum = 0.0f;
+            for (size_t j = seg.start; j < seg.start + seg.len; ++j) {
+                seg_var_sum += var[j];
+            }
+            float w = seg_var_sum / scale;
+            weighted_sum += w;
+            if (w > max_seg_weight) max_seg_weight = w;
         }
+
+        float epsilon_seg = sigma_ratio * std::sqrt(weighted_sum) / D_f;
+        float gamma = 2.0f * (1.0f - epsilon_seg);
+        calibration_.gamma_eff = (1.0f + gamma) * (1.0f + epsilon_seg) / (1.0f - epsilon_seg) - 1.0f;
+        calibration_.dot_slack = sigma_ratio * std::sqrt(max_seg_weight) / std::sqrt(D_f);
     }
 };
 

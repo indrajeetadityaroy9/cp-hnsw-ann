@@ -2,7 +2,7 @@
 #include <pybind11/numpy.h>
 #include <pybind11/stl.h>
 
-#include <cphnsw/api/hnsw_index.hpp>
+#include "index.hpp"
 
 #include <limits>
 #include <memory>

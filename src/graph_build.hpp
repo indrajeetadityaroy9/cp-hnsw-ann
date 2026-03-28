@@ -1,7 +1,7 @@
 #pragma once
 
-#include "../core/core.hpp"
-#include "rabitq_graph.hpp"
+#include "core.hpp"
+#include "graph.hpp"
 #include <vector>
 #include <algorithm>
 #include <numeric>
@@ -86,30 +86,12 @@ std::vector<SearchResult> select_neighbors_alpha_cng(
 // Graph Refinement
 // ============================================================
 
-constexpr size_t isqrt(size_t n) {
-    if (n < 2) return n;
-    size_t x = n, y = (x + 1) / 2;
-    while (y < x) { x = y; y = (x + n / x) / 2; }
-    return x;
-}
-
 struct GraphStats {
     float alpha;
     float tau;
     float alpha_max;
 };
 
-inline float stddev(const float* data, size_t n) {
-    float mean = 0.0f;
-    for (size_t i = 0; i < n; ++i) mean += data[i];
-    mean /= static_cast<float>(n);
-    float var = 0.0f;
-    for (size_t i = 0; i < n; ++i) {
-        float d = data[i] - mean;
-        var += d * d;
-    }
-    return std::sqrt(var / static_cast<float>(n));
-}
 namespace graph_refinement {
 
 template <size_t D, size_t BitWidth, typename EncType>
@@ -126,7 +108,22 @@ void prune_and_write(RaBitQGraph<D, BitWidth>& graph, const EncType& encoder,
     };
 
     auto selected = select_neighbors_alpha_cng(
-        std::move(candidates), GRAPH_DEGREE, dist_fn, error_fn, alpha, tau, alpha_max);
+        candidates, GRAPH_DEGREE, dist_fn, error_fn, alpha, tau, alpha_max);
+
+    if (selected.size() < GRAPH_DEGREE && candidates.size() >= GRAPH_DEGREE) {
+        float lo = alpha, hi = alpha_max;
+        while (selected.size() < GRAPH_DEGREE && lo < hi) {
+            float mid = (lo + hi) * 0.5f;
+            auto trial = select_neighbors_alpha_cng(
+                candidates, GRAPH_DEGREE, dist_fn, error_fn, mid, tau, alpha_max);
+            if (trial.size() >= GRAPH_DEGREE) {
+                selected = std::move(trial);
+                hi = mid;
+            } else {
+                lo = mid;
+            }
+        }
+    }
 
     auto& nb = graph.get_neighbors(node);
     nb.count = 0;
@@ -157,7 +154,8 @@ void init_working_random(
     #pragma omp parallel num_threads(actual_threads)
     {
         int tid = omp_get_thread_num();
-        std::mt19937 rng(static_cast<uint32_t>(42 + static_cast<uint64_t>(tid)));
+        // Seed from graph size for data-dependence, XOR with tid for per-thread variation
+        std::mt19937 rng(static_cast<uint32_t>(n ^ static_cast<uint64_t>(tid)));
 
         #pragma omp for schedule(static)
         for (size_t i = 0; i < n; ++i) {
@@ -350,7 +348,8 @@ GraphStats derive_graph_stats(
     GraphStats stats;
     size_t n = working.size();
     size_t actual_sample = std::min(sample_size, n);
-    std::mt19937 rng(static_cast<uint32_t>(42 + 1));
+    // Seed from sample size for data-dependence, distinct from init_working_random seed
+    std::mt19937 rng(static_cast<uint32_t>(n ^ sample_size));
     std::vector<size_t> sample_indices(n);
     std::iota(sample_indices.begin(), sample_indices.end(), 0);
     std::shuffle(sample_indices.begin(), sample_indices.end(), rng);
@@ -363,7 +362,9 @@ GraphStats derive_graph_stats(
     inter_neighbor_dists.reserve(actual_sample * GRAPH_DEGREE);
     nn_dists.reserve(actual_sample);
 
-    constexpr size_t inter_limit_val = std::min(2 * isqrt(GRAPH_DEGREE), GRAPH_DEGREE);
+    // 2*sqrt(R) neighbors gives C(2*sqrt(R),2) ≈ 2R pairwise distances — sufficient for quartile estimation
+    constexpr size_t ISQRT_R = []{ size_t x = GRAPH_DEGREE, y = (x+1)/2; while (y < x) { x = y; y = (x + GRAPH_DEGREE/x)/2; } return x; }();
+    constexpr size_t inter_limit_val = std::min(2 * ISQRT_R, GRAPH_DEGREE);
 
     for (size_t idx : sample_indices) {
         const auto& wl = working[idx];
@@ -393,20 +394,23 @@ GraphStats derive_graph_stats(
     float neighbor_dist_median = neighbor_dists[nd_n / 2];
     std::nth_element(neighbor_dists.begin() + nd_n / 2, neighbor_dists.begin() + 3 * nd_n / 4, neighbor_dists.end());
     float nd_q3 = neighbor_dists[3 * nd_n / 4];
-    float neighbor_q3_over_q1 = (nd_q1 > std::numeric_limits<float>::epsilon())
-        ? nd_q3 / nd_q1 : 0.0f;
+    float neighbor_q3_over_q1 = nd_q3 / nd_q1;
 
-    float nn_dist_sigma = stddev(nn_dists.data(), nn_dists.size());
+    float nn_mean = 0.0f;
+    for (size_t i = 0; i < nn_dists.size(); ++i) nn_mean += nn_dists[i];
+    nn_mean /= static_cast<float>(nn_dists.size());
+    float nn_var = 0.0f;
+    for (size_t i = 0; i < nn_dists.size(); ++i) {
+        float d = nn_dists[i] - nn_mean;
+        nn_var += d * d;
+    }
+    float nn_dist_sigma = std::sqrt(nn_var / static_cast<float>(nn_dists.size()));
 
     size_t inter_q1_idx = inter_neighbor_dists.size() / 4;
     std::nth_element(inter_neighbor_dists.begin(), inter_neighbor_dists.begin() + inter_q1_idx, inter_neighbor_dists.end());
     float d_inter = inter_neighbor_dists[inter_q1_idx];
 
-    if (d_inter < std::numeric_limits<float>::epsilon()) {
-        stats.alpha = 1.0f;
-    } else {
-        stats.alpha = neighbor_dist_median / d_inter;
-    }
+    stats.alpha = neighbor_dist_median / d_inter;
 
     stats.alpha_max = neighbor_q3_over_q1;
     stats.alpha = std::clamp(stats.alpha, 1.0f, stats.alpha_max);
@@ -494,7 +498,7 @@ optimize_graph_adaptive(RaBitQGraph<D, BitWidth>& graph, const EncType& encoder)
         graph, working, new_flags, actual_threads);
     float rate_1 = static_cast<float>(updates_1) / static_cast<float>(total_edges);
 
-    float decay_ratio = (rate_0 > std::numeric_limits<float>::epsilon()) ? rate_1 / rate_0 : 0.0f;
+    float decay_ratio = rate_1 / rate_0;
     // Natural domain of exponential smoothing factor: [0, 1]
     // α = 1-r is the optimal weight for a geometrically decaying process
     float ema_alpha = std::clamp(1.0f - decay_ratio, 0.0f, 1.0f);

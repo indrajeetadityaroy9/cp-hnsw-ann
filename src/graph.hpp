@@ -1,7 +1,7 @@
 #pragma once
 
-#include "../core/core.hpp"
-#include "../distance/fastscan_kernel.hpp"
+#include "core.hpp"
+#include "fastscan.hpp"
 #include <vector>
 #include <array>
 #include <queue>
@@ -31,11 +31,8 @@ public:
 
     static constexpr size_t DIMS = D;
 
-    explicit RaBitQGraph(size_t dim, size_t capacity = 1024)
+    explicit RaBitQGraph(size_t dim)
         : dim_(dim) {
-        search_data_.reserve(capacity);
-        raw_vectors_.reserve(capacity);
-        norm_sq_.reserve(capacity);
     }
 
     RaBitQGraph(const RaBitQGraph&) = delete;
@@ -114,9 +111,18 @@ public:
         return search_data_[id].neighbors;
     }
 
+    // Prefetch the vertex code + first batch of packed neighbor codes.
+    // sizeof(CodeType) covers the vertex's own quantization data;
+    // sizeof(NbitFastScanCodeBlock<D,BitWidth>) covers one batch of 32 packed neighbor codes.
+    // Cap to avoid saturating the prefetch queue for large D.
+    static constexpr size_t FIRST_BATCH_BYTES =
+        sizeof(CodeType) + sizeof(NbitFastScanCodeBlock<D, BitWidth>);
+    static constexpr size_t MAX_USEFUL_LINES =
+        (FIRST_BATCH_BYTES + CACHE_LINE_SIZE - 1) / CACHE_LINE_SIZE;
+    static constexpr size_t TOTAL_VERTEX_LINES =
+        sizeof(SearchDataType) / CACHE_LINE_SIZE;
     static constexpr size_t PREFETCH_LINES =
-        (sizeof(SearchDataType) / CACHE_LINE_SIZE < size_t(16))
-            ? (sizeof(SearchDataType) / CACHE_LINE_SIZE) : size_t(16);
+        (TOTAL_VERTEX_LINES < MAX_USEFUL_LINES) ? TOTAL_VERTEX_LINES : MAX_USEFUL_LINES;
 
     void prefetch_vertex(NodeId id) const {
         const char* base = reinterpret_cast<const char*>(&search_data_[id]);
@@ -128,7 +134,11 @@ public:
     void prefetch_vector(NodeId id) const {
         const char* base = reinterpret_cast<const char*>(raw_vectors_[id].data());
         constexpr size_t VEC_LINES = (D * sizeof(float) + CACHE_LINE_SIZE - 1) / CACHE_LINE_SIZE;
-        constexpr size_t MAX_VEC_LINES = (VEC_LINES < size_t(4)) ? VEC_LINES : size_t(4);
+        // Prefetch enough for the first SIMD iteration of dot_product_simd (32 floats = 128 bytes = 2 lines)
+        // plus headroom for the second iteration.
+        constexpr size_t DOT_FIRST_ITER_LINES = (32 * sizeof(float) + CACHE_LINE_SIZE - 1) / CACHE_LINE_SIZE;
+        constexpr size_t MAX_VEC_LINES = (VEC_LINES < 2 * DOT_FIRST_ITER_LINES)
+            ? VEC_LINES : 2 * DOT_FIRST_ITER_LINES;
         for (size_t line = 0; line < MAX_VEC_LINES; ++line) {
             prefetch_t<1>(base + line * CACHE_LINE_SIZE);
         }

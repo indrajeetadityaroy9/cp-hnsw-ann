@@ -4,9 +4,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
-#include <new>
 #include <vector>
-#include <queue>
 
 #include <immintrin.h>
 
@@ -32,12 +30,6 @@ struct SearchResult {
         return distance > other.distance;
     }
 };
-
-using MinHeap = std::priority_queue<SearchResult, std::vector<SearchResult>,
-                                     std::greater<SearchResult>>;
-
-using MaxHeap = std::priority_queue<SearchResult, std::vector<SearchResult>,
-                                     std::less<SearchResult>>;
 
 // ============================================================
 // Utility (formerly util.hpp)

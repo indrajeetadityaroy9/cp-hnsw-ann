@@ -1,6 +1,6 @@
 #pragma once
 
-#include "../core/core.hpp"
+#include "core.hpp"
 #include <climits>
 #include <limits>
 #include <cmath>
