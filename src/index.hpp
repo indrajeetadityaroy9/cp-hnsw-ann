@@ -1,6 +1,7 @@
 #pragma once
 
 #include "core.hpp"
+#include "calibration.hpp"
 #include "encoder.hpp"
 #include "graph.hpp"
 #include "graph_build.hpp"
@@ -16,11 +17,6 @@
 #include <omp.h>
 
 namespace cphnsw {
-
-struct CalibrationSnapshot {
-    float gamma_eff;
-    float dot_slack;
-};
 
 template <size_t D, size_t BitWidth = 1>
 class Index {
@@ -57,7 +53,7 @@ public:
     void finalize() {
         std::unique_lock<std::shared_mutex> lock(index_mutex_);
         graph_refinement::optimize_graph_adaptive(graph_, encoder_);
-        compute_analytic_bounds();
+        compute_calibration();
     }
 
     std::vector<SearchResult> search(
@@ -177,11 +173,11 @@ private:
     CalibrationSnapshot calibration_;
     mutable std::shared_mutex index_mutex_;
 
-    void compute_analytic_bounds() {
+    void compute_calibration() {
         float sigma_ratio = std::sqrt(static_cast<float>(M_PI) / 2.0f - 1.0f);
         float D_f = static_cast<float>(D);
 
-        // Segmentation-aware epsilon (E3):
+        // Segmentation-aware epsilon:
         // epsilon_seg = sigma_ratio * sqrt(sum_s sum_{j in Seg_s} V_j / 4^{B_s}) / D
         const auto& segments = encoder_.get_segments();
         const auto& var = encoder_.get_dim_variance();
@@ -200,9 +196,15 @@ private:
         }
 
         float epsilon_seg = sigma_ratio * std::sqrt(weighted_sum) / D_f;
-        float gamma = 2.0f * (1.0f - epsilon_seg);
-        calibration_.gamma_eff = (1.0f + gamma) * (1.0f + epsilon_seg) / (1.0f - epsilon_seg) - 1.0f;
-        calibration_.dot_slack = sigma_ratio * std::sqrt(max_seg_weight) / std::sqrt(D_f);
+        float dot_slack = sigma_ratio * std::sqrt(max_seg_weight) / std::sqrt(D_f);
+        
+        constexpr float GEOMETRIC_FACTOR = 2.0f;
+        constexpr float Z_999 = 3.09f;
+        float analytical_gamma_eff = GEOMETRIC_FACTOR * Z_999 * epsilon_seg;
+
+        // GPD calibration with analytical fallback
+        calibration_ = calibration::calibrate<D, BitWidth>(
+            graph_, encoder_, dot_slack, analytical_gamma_eff);
     }
 };
 
