@@ -9,7 +9,7 @@ import numpy as np
 import psutil
 
 import cphnsw
-from cphnsw.datasets import load_dataset
+from benchmarks.datasets import load_dataset
 
 BIT_WIDTHS = [1, 2, 4]
 BYTES_PER_MB = 1024 ** 2

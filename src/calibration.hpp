@@ -42,10 +42,10 @@ std::vector<float> collect_overestimation_ratios(
         int tid = omp_get_thread_num();
         auto& local = per_thread[tid];
 
-        alignas(64) uint32_t fscan[GRAPH_DEGREE];
-        alignas(64) uint32_t msb[GRAPH_DEGREE];
-        alignas(64) float est[GRAPH_DEGREE];
-        alignas(64) float lb[GRAPH_DEGREE];
+        alignas(SIMD_ALIGNMENT) uint32_t fscan[GRAPH_DEGREE];
+        alignas(SIMD_ALIGNMENT) uint32_t msb[GRAPH_DEGREE];
+        alignas(SIMD_ALIGNMENT) float est[GRAPH_DEGREE];
+        alignas(SIMD_ALIGNMENT) float lb[GRAPH_DEGREE];
 
         #pragma omp for schedule(guided)
         for (size_t si = 0; si < num_samples; ++si) {
@@ -75,7 +75,7 @@ std::vector<float> collect_overestimation_ratios(
                     query.lut, pnb.code_blocks[b], fscan + bs, msb + bs);
                 fastscan::convert_nbit_to_distances_with_bounds<D, BitWidth>(
                     query, fscan + bs, msb + bs,
-                    pnb.nop + bs, pnb.ip_qo + bs, pnb.ip_cp + bs,
+                    pnb.centered_norm + bs, pnb.code_ip + bs, pnb.code_parent_ip + bs,
                     pnb.popcounts + bs, pnb.weighted_popcounts + bs,
                     bc, est + bs, lb + bs, dqp);
             }

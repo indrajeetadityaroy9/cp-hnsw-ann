@@ -13,7 +13,7 @@ namespace cphnsw {
 
 
 template <size_t D, size_t BitWidth = 1>
-struct alignas(64) VertexSearchData {
+struct alignas(SIMD_ALIGNMENT) VertexSearchData {
     using CodeType = NbitRaBitQCode<D, BitWidth>;
     using NeighborBlockType = NbitFastScanNeighborBlock<D, BitWidth>;
 
@@ -226,41 +226,6 @@ public:
         return perm;
     }
 
-    NodeId find_nearest_to_centroid(const std::vector<double>& centroid) const {
-        size_t n = raw_vectors_.size();
-        NodeId best = INVALID_NODE;
-        double best_dist = std::numeric_limits<double>::max();
-
-        // Convert centroid to float for SIMD-friendly comparison
-        alignas(64) float centroid_f[D];
-        for (size_t j = 0; j < dim_; ++j) centroid_f[j] = static_cast<float>(centroid[j]);
-        for (size_t j = dim_; j < D; ++j) centroid_f[j] = 0.0f;
-
-        #pragma omp parallel
-        {
-            NodeId local_best = INVALID_NODE;
-            float local_best_dist = std::numeric_limits<float>::max();
-
-            #pragma omp for schedule(static) nowait
-            for (size_t i = 0; i < n; ++i) {
-                float dist = l2_distance_simd<D>(raw_vectors_[i].data(), centroid_f);
-                if (dist < local_best_dist) {
-                    local_best_dist = dist;
-                    local_best = static_cast<NodeId>(i);
-                }
-            }
-
-            #pragma omp critical
-            {
-                if (local_best_dist < best_dist) {
-                    best_dist = local_best_dist;
-                    best = local_best;
-                }
-            }
-        }
-        return best;
-    }
-
     NodeId find_hub_entry(const std::vector<double>& centroid) const {
         size_t n = raw_vectors_.size();
 
@@ -270,10 +235,8 @@ public:
             bool operator<(const CentroidDist& o) const { return dist < o.dist; }
         };
 
-        // Convert centroid to float for SIMD
-        alignas(64) float centroid_f[D];
-        for (size_t j = 0; j < dim_; ++j) centroid_f[j] = static_cast<float>(centroid[j]);
-        for (size_t j = dim_; j < D; ++j) centroid_f[j] = 0.0f;
+        alignas(SIMD_ALIGNMENT) float centroid_f[D];
+        centroid_to_float(centroid, centroid_f);
 
         size_t top_k = std::max<size_t>(1, static_cast<size_t>(std::sqrt(static_cast<double>(n))));
         std::vector<CentroidDist> dists(n);
@@ -305,6 +268,11 @@ private:
     std::vector<RawVector> raw_vectors_;
     AlignedVector<float> norm_sq_;
     NodeId entry_point_ = INVALID_NODE;
+
+    void centroid_to_float(const std::vector<double>& centroid, float* out) const {
+        for (size_t j = 0; j < dim_; ++j) out[j] = static_cast<float>(centroid[j]);
+        for (size_t j = dim_; j < D; ++j) out[j] = 0.0f;
+    }
 };
 
 }

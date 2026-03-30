@@ -174,37 +174,26 @@ private:
     mutable std::shared_mutex index_mutex_;
 
     void compute_calibration() {
+        // sigma_ratio = sqrt(pi/2 - 1): coefficient of variation of the
+        // half-normal distribution, from RaBitQ quantization error theory.
         float sigma_ratio = std::sqrt(static_cast<float>(M_PI) / 2.0f - 1.0f);
         float D_f = static_cast<float>(D);
 
-        // Segmentation-aware epsilon:
-        // epsilon_seg = sigma_ratio * sqrt(sum_s sum_{j in Seg_s} V_j / 4^{B_s}) / D
         const auto& segments = encoder_.get_segments();
         const auto& var = encoder_.get_dim_variance();
-        float weighted_sum = 0.0f;
         float max_seg_weight = 0.0f;
         for (const auto& seg : segments) {
-            float scale = 1.0f;
-            for (size_t b = 0; b < seg.bits; ++b) scale *= 4.0f;
+            float scale = static_cast<float>(1u << (2 * seg.bits));
             float seg_var_sum = 0.0f;
-            for (size_t j = seg.start; j < seg.start + seg.len; ++j) {
+            for (size_t j = seg.start; j < seg.start + seg.len; ++j)
                 seg_var_sum += var[j];
-            }
             float w = seg_var_sum / scale;
-            weighted_sum += w;
             if (w > max_seg_weight) max_seg_weight = w;
         }
 
-        float epsilon_seg = sigma_ratio * std::sqrt(weighted_sum) / D_f;
         float dot_slack = sigma_ratio * std::sqrt(max_seg_weight) / std::sqrt(D_f);
-        
-        constexpr float GEOMETRIC_FACTOR = 2.0f;
-        constexpr float Z_999 = 3.09f;
-        float analytical_gamma_eff = GEOMETRIC_FACTOR * Z_999 * epsilon_seg;
-
-        // GPD calibration with analytical fallback
         calibration_ = calibration::calibrate<D, BitWidth>(
-            graph_, encoder_, dot_slack, analytical_gamma_eff);
+            graph_, encoder_, dot_slack);
     }
 };
 

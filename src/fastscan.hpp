@@ -15,7 +15,7 @@ struct FastScanCodeBlock {
     static constexpr size_t NUM_SUB_SEGMENTS = num_sub_segments<D>;
     static constexpr size_t NUM_SUB_PAIRS = (NUM_SUB_SEGMENTS + 1) / 2;
 
-    alignas(64) uint8_t packed[NUM_SUB_PAIRS][32];
+    alignas(SIMD_ALIGNMENT) uint8_t packed[NUM_SUB_PAIRS][32];
 
     void store(size_t idx, const BinaryCodeStorage<D>& code) {
         for (size_t sp = 0; sp < NUM_SUB_PAIRS; ++sp) {
@@ -56,18 +56,18 @@ struct NbitFastScanNeighborBlock {
     static constexpr size_t NUM_BATCHES = GRAPH_DEGREE / 32;
 
     NbitFastScanCodeBlock<D, BitWidth> code_blocks[NUM_BATCHES];
-    alignas(64) float nop[GRAPH_DEGREE];
-    alignas(64) float ip_qo[GRAPH_DEGREE];
-    alignas(64) float ip_cp[GRAPH_DEGREE];
-    alignas(64) uint16_t popcounts[GRAPH_DEGREE];
-    alignas(64) uint16_t weighted_popcounts[GRAPH_DEGREE];
-    alignas(64) uint32_t neighbor_ids[GRAPH_DEGREE];
+    alignas(SIMD_ALIGNMENT) float centered_norm[GRAPH_DEGREE];
+    alignas(SIMD_ALIGNMENT) float code_ip[GRAPH_DEGREE];
+    alignas(SIMD_ALIGNMENT) float code_parent_ip[GRAPH_DEGREE];
+    alignas(SIMD_ALIGNMENT) uint16_t popcounts[GRAPH_DEGREE];
+    alignas(SIMD_ALIGNMENT) uint16_t weighted_popcounts[GRAPH_DEGREE];
+    alignas(SIMD_ALIGNMENT) uint32_t neighbor_ids[GRAPH_DEGREE];
     uint32_t count;
 
     NbitFastScanNeighborBlock() : count(0) {
-        std::memset(nop, 0, sizeof(nop));
-        std::memset(ip_qo, 0, sizeof(ip_qo));
-        std::memset(ip_cp, 0, sizeof(ip_cp));
+        std::memset(centered_norm, 0, sizeof(centered_norm));
+        std::memset(code_ip, 0, sizeof(code_ip));
+        std::memset(code_parent_ip, 0, sizeof(code_parent_ip));
         std::memset(neighbor_ids, 0xFF, sizeof(neighbor_ids));
         std::memset(popcounts, 0, sizeof(popcounts));
         std::memset(weighted_popcounts, 0, sizeof(weighted_popcounts));
@@ -78,9 +78,9 @@ struct NbitFastScanNeighborBlock {
                       const VertexAuxData& aux_data) {
         neighbor_ids[slot] = id;
         code_blocks[slot / 32].store(slot % 32, code);
-        nop[slot] = aux_data.nop;
-        ip_qo[slot] = aux_data.ip_qo;
-        ip_cp[slot] = aux_data.ip_cp;
+        centered_norm[slot] = aux_data.centered_norm;
+        code_ip[slot] = aux_data.code_ip;
+        code_parent_ip[slot] = aux_data.code_parent_ip;
         popcounts[slot] = static_cast<uint16_t>(code.msb_popcount());
         weighted_popcounts[slot] = static_cast<uint16_t>(code.weighted_popcount());
         if (slot >= count) count = static_cast<uint32_t>(slot + 1);
@@ -167,7 +167,7 @@ inline void compute_nbit_inner_products(
     uint32_t* __restrict__ out_msb)
 {
     std::memset(out_nbit, 0, 32 * sizeof(uint32_t));
-    alignas(64) uint32_t plane_sums[32];
+    alignas(SIMD_ALIGNMENT) uint32_t plane_sums[32];
 
     for (size_t b = 0; b < BitWidth; ++b) {
         compute_inner_products<D>(lut, block.planes[b], plane_sums);
@@ -187,9 +187,9 @@ inline void convert_nbit_to_distances_with_bounds(
     const RaBitQQuery<D>& query,
     const uint32_t* nbit_fastscan_sums,
     const uint32_t* msb_fastscan_sums,
-    const float* nop_arr,
-    const float* ip_qo_p_arr,
-    const float* ip_cp_arr,
+    const float* centered_norm_arr,
+    const float* code_ip_arr,
+    const float* code_parent_ip_arr,
     const uint16_t* msb_popcounts,
     const uint16_t* weighted_popcounts,
     size_t count,
@@ -226,31 +226,31 @@ inline void convert_nbit_to_distances_with_bounds(
             _mm256_load_si256(reinterpret_cast<const __m256i*>(weighted_popcounts + i))));
         __m512 ip_approx_nbit = _mm512_fmadd_ps(vA_nbit_w, nbit_fs, _mm512_fmadd_ps(vB_nbit_w, vwpc, vC_w));
 
-        __m512 ip_qo_p = _mm512_load_ps(ip_qo_p_arr + i);
-        __m512 ip_cp = _mm512_load_ps(ip_cp_arr + i);
-        __m512 nop = _mm512_load_ps(nop_arr + i);
-        __m512 rcp_qo = rcp_nr(ip_qo_p);
+        __m512 code_ip = _mm512_load_ps(code_ip_arr + i);
+        __m512 code_parent_ip = _mm512_load_ps(code_parent_ip_arr + i);
+        __m512 centered_norm = _mm512_load_ps(centered_norm_arr + i);
+        __m512 rcp_code_ip = rcp_nr(code_ip);
 
-        __m512 ip_est_nbit = _mm512_mul_ps(_mm512_sub_ps(ip_approx_nbit, ip_cp), rcp_qo);
+        __m512 ip_est_nbit = _mm512_mul_ps(_mm512_sub_ps(ip_approx_nbit, code_parent_ip), rcp_code_ip);
 
-        __m512 two_nop = _mm512_add_ps(nop, nop);
-        __m512 nop_sq_plus_dqp = _mm512_fmadd_ps(nop, nop, vdist_qp_sq_w);
+        __m512 two_centered_norm = _mm512_add_ps(centered_norm, centered_norm);
+        __m512 centered_norm_sq_plus_dqp = _mm512_fmadd_ps(centered_norm, centered_norm, vdist_qp_sq_w);
 
         _mm512_store_ps(out_dist + i,
-            _mm512_fnmadd_ps(two_nop, ip_est_nbit, nop_sq_plus_dqp));
+            _mm512_fnmadd_ps(two_centered_norm, ip_est_nbit, centered_norm_sq_plus_dqp));
 
         __m512 msb_fs = _mm512_cvtepi32_ps(_mm512_loadu_si512(msb_fastscan_sums + i));
         __m512 vmpc = _mm512_cvtepi32_ps(_mm512_cvtepu16_epi32(
             _mm256_load_si256(reinterpret_cast<const __m256i*>(msb_popcounts + i))));
         __m512 ip_est_msb = _mm512_mul_ps(_mm512_sub_ps(
-                _mm512_fmadd_ps(vA_msb_w, msb_fs, _mm512_fmadd_ps(vB_msb_w, vmpc, vC_w)), ip_cp), rcp_qo);
+                _mm512_fmadd_ps(vA_msb_w, msb_fs, _mm512_fmadd_ps(vB_msb_w, vmpc, vC_w)), code_parent_ip), rcp_code_ip);
 
         __m512 cos_upper = _mm512_min_ps(_mm512_max_ps(
             _mm512_mul_ps(_mm512_add_ps(ip_est_msb, vdot_slack_w), vrcp_sqrt_dqp_w),
             vneg_one_w), vone_w);
 
         _mm512_store_ps(out_lower + i,
-            _mm512_fnmadd_ps(_mm512_mul_ps(two_nop, vsqrt_dqp_w), cos_upper, nop_sq_plus_dqp));
+            _mm512_fnmadd_ps(_mm512_mul_ps(two_centered_norm, vsqrt_dqp_w), cos_upper, centered_norm_sq_plus_dqp));
     }
 #endif
 
@@ -272,46 +272,46 @@ inline void convert_nbit_to_distances_with_bounds(
             _mm_load_si128(reinterpret_cast<const __m128i*>(weighted_popcounts + i))));
         __m256 ip_approx_nbit = _mm256_fmadd_ps(vA_nbit, nbit_fs, _mm256_fmadd_ps(vB_nbit, vwpc, vC));
 
-        __m256 ip_qo_p = _mm256_load_ps(ip_qo_p_arr + i);
-        __m256 ip_cp = _mm256_load_ps(ip_cp_arr + i);
-        __m256 nop = _mm256_load_ps(nop_arr + i);
-        __m256 rcp_qo = rcp_nr(ip_qo_p);
+        __m256 code_ip = _mm256_load_ps(code_ip_arr + i);
+        __m256 code_parent_ip = _mm256_load_ps(code_parent_ip_arr + i);
+        __m256 centered_norm = _mm256_load_ps(centered_norm_arr + i);
+        __m256 rcp_code_ip = rcp_nr(code_ip);
 
-        __m256 ip_est_nbit = _mm256_mul_ps(_mm256_sub_ps(ip_approx_nbit, ip_cp), rcp_qo);
+        __m256 ip_est_nbit = _mm256_mul_ps(_mm256_sub_ps(ip_approx_nbit, code_parent_ip), rcp_code_ip);
 
-        __m256 two_nop = _mm256_add_ps(nop, nop);
-        __m256 nop_sq_plus_dqp = _mm256_fmadd_ps(nop, nop, vdist_qp_sq);
+        __m256 two_centered_norm = _mm256_add_ps(centered_norm, centered_norm);
+        __m256 centered_norm_sq_plus_dqp = _mm256_fmadd_ps(centered_norm, centered_norm, vdist_qp_sq);
 
         _mm256_store_ps(out_dist + i,
-            _mm256_fnmadd_ps(two_nop, ip_est_nbit, nop_sq_plus_dqp));
+            _mm256_fnmadd_ps(two_centered_norm, ip_est_nbit, centered_norm_sq_plus_dqp));
 
         __m256 msb_fs = _mm256_cvtepi32_ps(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(msb_fastscan_sums + i)));
         __m256 vmpc = _mm256_cvtepi32_ps(_mm256_cvtepu16_epi32(
             _mm_load_si128(reinterpret_cast<const __m128i*>(msb_popcounts + i))));
         __m256 ip_est_msb = _mm256_mul_ps(_mm256_sub_ps(
-                _mm256_fmadd_ps(vA_msb, msb_fs, _mm256_fmadd_ps(vB_msb, vmpc, vC)), ip_cp), rcp_qo);
+                _mm256_fmadd_ps(vA_msb, msb_fs, _mm256_fmadd_ps(vB_msb, vmpc, vC)), code_parent_ip), rcp_code_ip);
 
         __m256 cos_upper = _mm256_min_ps(_mm256_max_ps(
             _mm256_mul_ps(_mm256_add_ps(ip_est_msb, vdot_slack), vrcp_sqrt_dqp),
             vneg_one), vone);
 
         _mm256_store_ps(out_lower + i,
-            _mm256_fnmadd_ps(_mm256_mul_ps(two_nop, vsqrt_dqp), cos_upper, nop_sq_plus_dqp));
+            _mm256_fnmadd_ps(_mm256_mul_ps(two_centered_norm, vsqrt_dqp), cos_upper, centered_norm_sq_plus_dqp));
     }
 
     for (; i < count; ++i) {
-        float rcp_qo = 1.0f / ip_qo_p_arr[i];
-        float nop = nop_arr[i];
-        float nop_sq_dqp = nop * nop + dist_qp_sq;
+        float rcp_code_ip = 1.0f / code_ip_arr[i];
+        float centered_norm = centered_norm_arr[i];
+        float centered_norm_sq_dqp = centered_norm * centered_norm + dist_qp_sq;
 
         float ip_est_nbit = (A_nbit * static_cast<float>(nbit_fastscan_sums[i])
-            + B_nbit * static_cast<float>(weighted_popcounts[i]) + C - ip_cp_arr[i]) * rcp_qo;
-        out_dist[i] = nop_sq_dqp - 2.0f * nop * ip_est_nbit;
+            + B_nbit * static_cast<float>(weighted_popcounts[i]) + C - code_parent_ip_arr[i]) * rcp_code_ip;
+        out_dist[i] = centered_norm_sq_dqp - 2.0f * centered_norm * ip_est_nbit;
 
         float ip_est_msb = (query.coeff_fastscan * static_cast<float>(msb_fastscan_sums[i])
-            + query.coeff_popcount * static_cast<float>(msb_popcounts[i]) + C - ip_cp_arr[i]) * rcp_qo;
+            + query.coeff_popcount * static_cast<float>(msb_popcounts[i]) + C - code_parent_ip_arr[i]) * rcp_code_ip;
         float cos_upper = std::clamp((ip_est_msb + dot_slack) / sqrt_dqp, -1.0f, 1.0f);
-        out_lower[i] = nop_sq_dqp - 2.0f * nop * sqrt_dqp * cos_upper;
+        out_lower[i] = centered_norm_sq_dqp - 2.0f * centered_norm * sqrt_dqp * cos_upper;
     }
 }
 
@@ -324,7 +324,7 @@ inline void compute_msb_only_inner_products(
     compute_inner_products<D>(lut, block.planes[0], out_msb);
 
     if constexpr (BitWidth >= 2) {
-        alignas(64) uint32_t plane1_sums[32];
+        alignas(SIMD_ALIGNMENT) uint32_t plane1_sums[32];
         compute_inner_products<D>(lut, block.planes[1], plane1_sums);
         for (size_t i = 0; i < 32; i += 8) {
             __m256i vmsb = _mm256_load_si256(reinterpret_cast<const __m256i*>(out_msb + i));
@@ -339,9 +339,9 @@ template <size_t D, size_t BitWidth>
 inline void convert_msb_to_lower_bounds(
     const RaBitQQuery<D>& query,
     const uint32_t* msb_fastscan_sums,
-    const float* nop_arr,
-    const float* ip_qo_p_arr,
-    const float* ip_cp_arr,
+    const float* centered_norm_arr,
+    const float* code_ip_arr,
+    const float* code_parent_ip_arr,
     const uint16_t* msb_popcounts,
     size_t count,
     float* __restrict__ out_lower,
@@ -374,20 +374,20 @@ inline void convert_msb_to_lower_bounds(
             _mm256_load_si256(reinterpret_cast<const __m256i*>(msb_popcounts + i))));
         __m512 ip_approx = _mm512_fmadd_ps(vA_w, fs, _mm512_fmadd_ps(vB_w, vpc, vC_w));
 
-        __m512 ip_qo_p = _mm512_load_ps(ip_qo_p_arr + i);
-        __m512 ip_cp = _mm512_load_ps(ip_cp_arr + i);
-        __m512 nop = _mm512_load_ps(nop_arr + i);
+        __m512 code_ip = _mm512_load_ps(code_ip_arr + i);
+        __m512 code_parent_ip = _mm512_load_ps(code_parent_ip_arr + i);
+        __m512 centered_norm = _mm512_load_ps(centered_norm_arr + i);
 
-        __m512 ip_est = _mm512_mul_ps(_mm512_sub_ps(ip_approx, ip_cp), rcp_nr(ip_qo_p));
+        __m512 ip_est = _mm512_mul_ps(_mm512_sub_ps(ip_approx, code_parent_ip), rcp_nr(code_ip));
 
         __m512 cos_upper = _mm512_min_ps(_mm512_max_ps(
             _mm512_mul_ps(_mm512_add_ps(ip_est, vdot_slack_w), vrcp_sqrt_dqp_w),
             vneg_one_w), vone_w);
 
-        __m512 two_nop = _mm512_add_ps(nop, nop);
+        __m512 two_centered_norm = _mm512_add_ps(centered_norm, centered_norm);
         _mm512_store_ps(out_lower + i,
-            _mm512_fnmadd_ps(_mm512_mul_ps(two_nop, vsqrt_dqp_w), cos_upper,
-                _mm512_fmadd_ps(nop, nop, vdist_qp_sq_w)));
+            _mm512_fnmadd_ps(_mm512_mul_ps(two_centered_norm, vsqrt_dqp_w), cos_upper,
+                _mm512_fmadd_ps(centered_norm, centered_norm, vdist_qp_sq_w)));
     }
 #endif
 
@@ -407,28 +407,28 @@ inline void convert_msb_to_lower_bounds(
             _mm_load_si128(reinterpret_cast<const __m128i*>(msb_popcounts + i))));
         __m256 ip_approx = _mm256_fmadd_ps(vA, fs, _mm256_fmadd_ps(vB, vpc, vC));
 
-        __m256 ip_qo_p = _mm256_load_ps(ip_qo_p_arr + i);
-        __m256 ip_cp = _mm256_load_ps(ip_cp_arr + i);
-        __m256 nop = _mm256_load_ps(nop_arr + i);
+        __m256 code_ip = _mm256_load_ps(code_ip_arr + i);
+        __m256 code_parent_ip = _mm256_load_ps(code_parent_ip_arr + i);
+        __m256 centered_norm = _mm256_load_ps(centered_norm_arr + i);
 
-        __m256 ip_est = _mm256_mul_ps(_mm256_sub_ps(ip_approx, ip_cp), rcp_nr(ip_qo_p));
+        __m256 ip_est = _mm256_mul_ps(_mm256_sub_ps(ip_approx, code_parent_ip), rcp_nr(code_ip));
 
         __m256 cos_upper = _mm256_min_ps(_mm256_max_ps(
             _mm256_mul_ps(_mm256_add_ps(ip_est, vdot_slack), vrcp_sqrt_dqp),
             vneg_one), vone);
 
-        __m256 two_nop = _mm256_add_ps(nop, nop);
+        __m256 two_centered_norm = _mm256_add_ps(centered_norm, centered_norm);
         _mm256_store_ps(out_lower + i,
-            _mm256_fnmadd_ps(_mm256_mul_ps(two_nop, vsqrt_dqp), cos_upper,
-                _mm256_fmadd_ps(nop, nop, vdist_qp_sq)));
+            _mm256_fnmadd_ps(_mm256_mul_ps(two_centered_norm, vsqrt_dqp), cos_upper,
+                _mm256_fmadd_ps(centered_norm, centered_norm, vdist_qp_sq)));
     }
 
     for (; i < count; ++i) {
         float ip_approx = A * static_cast<float>(msb_fastscan_sums[i])
                         + B * static_cast<float>(msb_popcounts[i]) + C;
-        float ip_est = (ip_approx - ip_cp_arr[i]) / ip_qo_p_arr[i];
+        float ip_est = (ip_approx - code_parent_ip_arr[i]) / code_ip_arr[i];
         float cos_upper = std::clamp((ip_est + dot_slack) / sqrt_dqp, -1.0f, 1.0f);
-        out_lower[i] = nop_arr[i] * nop_arr[i] + dist_qp_sq - 2.0f * nop_arr[i] * sqrt_dqp * cos_upper;
+        out_lower[i] = centered_norm_arr[i] * centered_norm_arr[i] + dist_qp_sq - 2.0f * centered_norm_arr[i] * sqrt_dqp * cos_upper;
     }
 }
 

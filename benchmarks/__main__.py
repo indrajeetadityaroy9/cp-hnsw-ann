@@ -1,4 +1,4 @@
-"""CLI entrypoint for ``python -m cphnsw``."""
+"""CLI entrypoint for ``python -m benchmarks``."""
 
 import argparse
 import json
@@ -6,11 +6,11 @@ from pathlib import Path
 
 import yaml
 
-from cphnsw.eval import run_benchmark
+from benchmarks.eval import run_benchmark
 
 
 def main(argv: list[str] | None = None) -> None:
-    parser = argparse.ArgumentParser(prog="cphnsw")
+    parser = argparse.ArgumentParser(prog="benchmarks")
     parser.add_argument("--config", type=Path, required=True)
     args = parser.parse_args(argv)
 

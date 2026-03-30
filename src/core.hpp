@@ -180,7 +180,7 @@ template <size_t D>
 constexpr size_t num_sub_segments = (D + 3) / 4;
 
 template <size_t Bits>
-struct alignas(64) BinaryCodeStorage {
+struct alignas(SIMD_ALIGNMENT) BinaryCodeStorage {
     static constexpr size_t NUM_BITS = Bits;
     static constexpr size_t NUM_WORDS = (Bits + 63) / 64;
 
@@ -212,9 +212,9 @@ struct alignas(64) BinaryCodeStorage {
 };
 
 struct VertexAuxData {
-    float nop;
-    float ip_qo;
-    float ip_cp;
+    float centered_norm;
+    float code_ip;
+    float code_parent_ip;
 };
 
 template <size_t D>
@@ -222,7 +222,7 @@ struct RaBitQQuery {
     static constexpr size_t DIMS = D;
     static constexpr size_t NUM_SUB_SEGMENTS = num_sub_segments<D>;
 
-    alignas(64) uint8_t lut[NUM_SUB_SEGMENTS][16];
+    alignas(SIMD_ALIGNMENT) uint8_t lut[NUM_SUB_SEGMENTS][16];
 
     float coeff_fastscan;
     float coeff_popcount;
@@ -233,7 +233,7 @@ struct RaBitQQuery {
 
 
 template <size_t D, size_t BitWidth>
-struct alignas(64) NbitCodeStorage {
+struct alignas(SIMD_ALIGNMENT) NbitCodeStorage {
     static constexpr size_t NUM_BITS = D;
     static constexpr size_t BIT_WIDTH = BitWidth;
     static constexpr size_t NUM_WORDS = (D + 63) / 64;
@@ -278,13 +278,13 @@ struct NbitRaBitQCode {
     static constexpr size_t BIT_WIDTH = BitWidth;
 
     NbitCodeStorage<D, BitWidth> codes;
-    float nop;
-    float ip_qo;
+    float centered_norm;
+    float code_ip;
 
     void clear() {
         codes.clear();
-        nop = 0.0f;
-        ip_qo = 0.0f;
+        centered_norm = 0.0f;
+        code_ip = 0.0f;
     }
 };
 

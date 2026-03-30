@@ -83,8 +83,7 @@ std::vector<Segment> compute_segmentation(
                     if (next_b > total_bit_budget) continue;
 
                     // Quantization error weight: sum_variance / 4^bits
-                    float scale = 1.0f;
-                    for (size_t s = 0; s < seg_bits; ++s) scale *= 4.0f;
+                    float scale = static_cast<float>(1u << (2 * seg_bits));
                     float err = cur + sv / scale;
                     if (err < dp[idx(next_d_step, next_b)]) {
                         dp[idx(next_d_step, next_b)] = err;

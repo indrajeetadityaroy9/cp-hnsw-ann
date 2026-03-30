@@ -234,59 +234,52 @@ public:
 
     QueryType encode_query_raw(const float* vec) const {
         thread_local AlignedVector<float> buf(padded_dim_);
-        thread_local AlignedVector<uint8_t> q_bar_u(padded_dim_);
+        thread_local AlignedVector<uint8_t> quantized_query(padded_dim_);
         buf.resize(padded_dim_);
-        q_bar_u.resize(padded_dim_);
+        quantized_query.resize(padded_dim_);
 
         QueryType query;
-        rotation_.apply_copy(vec, buf.data());
-#ifdef __AVX512F__
-        { __m512 vnf = _mm512_set1_ps(norm_factor_);
-        for (size_t i = 0; i < padded_dim_; i += 16)
-            _mm512_storeu_ps(buf.data() + i, _mm512_mul_ps(_mm512_loadu_ps(buf.data() + i), vnf)); }
-#else
-        { __m256 vnf = _mm256_set1_ps(norm_factor_);
-        for (size_t i = 0; i < padded_dim_; i += 8)
-            _mm256_storeu_ps(buf.data() + i, _mm256_mul_ps(_mm256_loadu_ps(buf.data() + i), vnf)); }
-#endif
-        build_lut(buf.data(), q_bar_u.data(), query);
+        rotate_and_normalize(vec, buf.data());
+        build_lut(buf.data(), quantized_query.data(), query);
         return query;
     }
 
-    void rotate_raw_vector(const float* vec, float* out) const {
-        rotation_.apply_copy(vec, out);
+    void rotate_and_normalize(const float* input, float* output) const {
+        rotation_.apply_copy(input, output);
 #ifdef __AVX512F__
         __m512 vnf = _mm512_set1_ps(norm_factor_);
-        for (size_t i = 0; i < padded_dim_; i += 16) {
-            _mm512_storeu_ps(out + i, _mm512_mul_ps(_mm512_loadu_ps(out + i), vnf));
-        }
+        for (size_t i = 0; i < padded_dim_; i += 16)
+            _mm512_storeu_ps(output + i, _mm512_mul_ps(_mm512_loadu_ps(output + i), vnf));
 #else
         __m256 vnf = _mm256_set1_ps(norm_factor_);
-        for (size_t i = 0; i < padded_dim_; i += 8) {
-            _mm256_storeu_ps(out + i, _mm256_mul_ps(_mm256_loadu_ps(out + i), vnf));
-        }
+        for (size_t i = 0; i < padded_dim_; i += 8)
+            _mm256_storeu_ps(output + i, _mm256_mul_ps(_mm256_loadu_ps(output + i), vnf));
 #endif
     }
 
-    void build_lut(const float* buf, uint8_t* q_bar_u, QueryType& query) const {
+    void rotate_raw_vector(const float* vec, float* out) const {
+        rotate_and_normalize(vec, out);
+    }
+
+    void build_lut(const float* buf, uint8_t* quantized_query, QueryType& query) const {
         constexpr float LUT_LEVELS = static_cast<float>((1 << (CHAR_BIT / 2)) - 1);
-        float vl = buf[0], vmax = buf[0];
+        float lut_min = buf[0], lut_max = buf[0];
         for (size_t i = 1; i < padded_dim_; ++i) {
-            if (buf[i] < vl) vl = buf[i];
-            if (buf[i] > vmax) vmax = buf[i];
+            if (buf[i] < lut_min) lut_min = buf[i];
+            if (buf[i] > lut_max) lut_max = buf[i];
         }
 
-        float delta = (vmax - vl) / LUT_LEVELS;
+        float delta = (lut_max - lut_min) / LUT_LEVELS;
         float inv_delta = 1.0f / delta;
 
-        float sum_qu = 0.0f;
+        float quantized_sum = 0.0f;
         for (size_t i = 0; i < padded_dim_; ++i) {
-            float val = (buf[i] - vl) * inv_delta;
+            float val = (buf[i] - lut_min) * inv_delta;
             int u = static_cast<int>(val + 0.5f);
             if (u < 0) u = 0;
             if (u > static_cast<int>(LUT_LEVELS)) u = static_cast<int>(LUT_LEVELS);
-            q_bar_u[i] = static_cast<uint8_t>(u);
-            sum_qu += static_cast<float>(u);
+            quantized_query[i] = static_cast<uint8_t>(u);
+            quantized_sum += static_cast<float>(u);
         }
 
         for (size_t j = 0; j < NUM_SUB_SEGMENTS; ++j) {
@@ -295,7 +288,7 @@ public:
                 for (size_t b = 0; b < 4; ++b) {
                     size_t idx = j * 4 + b;
                     if (idx < D && (p & (1u << b))) {
-                        sum += q_bar_u[idx];
+                        sum += quantized_query[idx];
                     }
                 }
                 query.lut[j][p] = sum;
@@ -304,8 +297,8 @@ public:
 
         float Df = static_cast<float>(D);
         query.coeff_fastscan = 2.0f * delta * inv_sqrt_d_;
-        query.coeff_popcount = 2.0f * vl * inv_sqrt_d_;
-        query.coeff_constant = -(Df * vl + delta * sum_qu) * inv_sqrt_d_;
+        query.coeff_popcount = 2.0f * lut_min * inv_sqrt_d_;
+        query.coeff_constant = -(Df * lut_min + delta * quantized_sum) * inv_sqrt_d_;
     }
 
     const std::vector<float>& get_centroid() const { return centroid_; }
@@ -319,36 +312,27 @@ public:
         VertexAuxData result_aux;
         result_code.clear();
 
-        alignas(64) float diff[D];
-        float nop_sq = 0.0f;
+        alignas(SIMD_ALIGNMENT) float diff[D];
+        float centered_norm_sq = 0.0f;
         for (size_t i = 0; i < dim_; ++i) {
             diff[i] = neighbor_vec[i] - parent_vec[i];
-            nop_sq += diff[i] * diff[i];
+            centered_norm_sq += diff[i] * diff[i];
         }
         for (size_t i = dim_; i < D; ++i) diff[i] = 0.0f;
 
-        float nop = std::sqrt(nop_sq);
-        result_aux.nop = nop;
+        float centered_norm = std::sqrt(centered_norm_sq);
+        result_aux.centered_norm = centered_norm;
 
-        float inv_nop = 1.0f / nop;
-        for (size_t i = 0; i < D; ++i) diff[i] *= inv_nop;
+        float inv_centered_norm = 1.0f / centered_norm;
+        for (size_t i = 0; i < D; ++i) diff[i] *= inv_centered_norm;
 
-        alignas(64) float rotated[D];
-        rotation_.apply_copy(diff, rotated);
-#ifdef __AVX512F__
-        { __m512 vnf = _mm512_set1_ps(norm_factor_);
-        for (size_t i = 0; i < padded_dim_; i += 16)
-            _mm512_storeu_ps(rotated + i, _mm512_mul_ps(_mm512_loadu_ps(rotated + i), vnf)); }
-#else
-        { __m256 vnf = _mm256_set1_ps(norm_factor_);
-        for (size_t i = 0; i < padded_dim_; i += 8)
-            _mm256_storeu_ps(rotated + i, _mm256_mul_ps(_mm256_loadu_ps(rotated + i), vnf)); }
-#endif
+        alignas(SIMD_ALIGNMENT) float rotated[D];
+        rotate_and_normalize(diff, rotated);
 
-        float ip_cp = 0.0f;
-        result_aux.ip_qo = caq_quantize(rotated, result_code,
-                                         rotated_parent, &ip_cp);
-        result_aux.ip_cp = ip_cp;
+        float code_parent_ip = 0.0f;
+        result_aux.code_ip = caq_quantize(rotated, result_code,
+                                         rotated_parent, &code_parent_ip);
+        result_aux.code_parent_ip = code_parent_ip;
         return {std::move(result_code), result_aux};
     }
 
@@ -363,23 +347,14 @@ public:
             norm_sq += v * v;
         }
         float norm = std::sqrt(norm_sq);
-        code.nop = norm;
+        code.centered_norm = norm;
 
         float inv_norm = 1.0f / norm;
         for (size_t i = 0; i < dim_; ++i) centered_buf[i] *= inv_norm;
 
-        rotation_.apply_copy(centered_buf, buf);
-#ifdef __AVX512F__
-        { __m512 vnf = _mm512_set1_ps(norm_factor_);
-        for (size_t i = 0; i < padded_dim_; i += 16)
-            _mm512_storeu_ps(buf + i, _mm512_mul_ps(_mm512_loadu_ps(buf + i), vnf)); }
-#else
-        { __m256 vnf = _mm256_set1_ps(norm_factor_);
-        for (size_t i = 0; i < padded_dim_; i += 8)
-            _mm256_storeu_ps(buf + i, _mm256_mul_ps(_mm256_loadu_ps(buf + i), vnf)); }
-#endif
+        rotate_and_normalize(centered_buf, buf);
 
-        code.ip_qo = caq_quantize(buf, code.codes);
+        code.code_ip = caq_quantize(buf, code.codes);
         return code;
     }
 
@@ -396,7 +371,7 @@ private:
     std::array<float, D> k_float_;
 
     void compute_segmentation_from_data(const float* vecs, size_t num_vecs) {
-        alignas(64) float var[D] = {};
+        alignas(SIMD_ALIGNMENT) float var[D] = {};
         AlignedVector<float> buf(padded_dim_);
         std::vector<float> centered(dim_);
 
@@ -410,8 +385,7 @@ private:
             float inv_norm = 1.0f / std::sqrt(norm_sq);
             for (size_t j = 0; j < dim_; ++j) centered[j] *= inv_norm;
 
-            rotation_.apply_copy(centered.data(), buf.data());
-            for (size_t j = 0; j < padded_dim_; ++j) buf[j] *= norm_factor_;
+            rotate_and_normalize(centered.data(), buf.data());
 
             for (size_t j = 0; j < D; ++j) var[j] += buf[j] * buf[j];
         }
@@ -435,7 +409,7 @@ private:
     float caq_quantize(const float* rotated_buf,
                        NbitCodeStorage<D, BitWidth>& out_code,
                        const float* rotated_parent = nullptr,
-                       float* out_ip_cp = nullptr) const {
+                       float* out_code_parent_ip = nullptr) const {
         const size_t pd = padded_dim_;
 
         float buf_min = rotated_buf[0], buf_max = rotated_buf[0];
@@ -446,88 +420,88 @@ private:
         float range = buf_max - buf_min;
         float inv_range = 1.0f / range;
 
-        thread_local std::vector<int> codes_arr;
-        codes_arr.resize(pd);
+        thread_local std::vector<int> levels;
+        levels.resize(pd);
 
-        float dot_co = 0.0f, norm_c_sq = 0.0f;
+        float code_vec_ip = 0.0f, code_norm_sq = 0.0f;
         for (size_t i = 0; i < pd; ++i) {
             float kf = k_float_[i];
             float val = (rotated_buf[i] - buf_min) * inv_range * kf;
             int u = static_cast<int>(val + 0.5f);
             if (u < 0) u = 0;
             if (u > k_int_[i]) u = k_int_[i];
-            codes_arr[i] = u;
-            float c = (2.0f * u - kf) / kf;
-            dot_co += c * rotated_buf[i];
-            norm_c_sq += c * c;
+            levels[i] = u;
+            float coeff = (2.0f * u - kf) / kf;
+            code_vec_ip += c * rotated_buf[i];
+            code_norm_sq += c * c;
         }
 
-        float prev_cos_sq = 0.0f;
+        float prev_cosine_sq = 0.0f;
         for (size_t iter = 0; ; ++iter) {
             bool changed = false;
             for (size_t i = 0; i < pd; ++i) {
                 float kf = k_float_[i];
                 int ki = k_int_[i];
-                int old_u = codes_arr[i];
-                float old_c = (2.0f * old_u - kf) / kf;
-                float dot_without = dot_co - old_c * rotated_buf[i];
-                float norm_without = norm_c_sq - old_c * old_c;
-                int best_u = old_u;
-                float best_dot = dot_co, best_norm = norm_c_sq;
+                int old_level = levels[i];
+                float old_coeff = (2.0f * old_level - kf) / kf;
+                float ip_without_dim = code_vec_ip - old_coeff * rotated_buf[i];
+                float norm_sq_without_dim = code_norm_sq - old_coeff * old_coeff;
+                int best_level = old_level;
+                float best_ip = code_vec_ip, best_norm_sq = code_norm_sq;
                 // K for the largest allowed bit width; delta search above, exhaustive below
                 constexpr int DELTA_SEARCH_K = (1 << ALLOWED_BITS[NUM_ALLOWED_BITS - 1]) - 1;
                 if (ki >= DELTA_SEARCH_K) {
                     for (int d : {-1, +1}) {
-                        int u_try = old_u + d;
-                        if (u_try < 0 || u_try > ki) continue;
-                        float c = (2.0f * u_try - kf) / kf;
-                        float new_dot = dot_without + c * rotated_buf[i];
-                        float new_norm = norm_without + c * c;
-                        if (new_dot * new_dot * best_norm > best_dot * best_dot * new_norm) {
-                            best_u = u_try;
-                            best_dot = new_dot;
-                            best_norm = new_norm;
+                        int try_level = old_level + d;
+                        if (try_level < 0 || try_level > ki) continue;
+                        float coeff = (2.0f * try_level - kf) / kf;
+                        float cand_ip = ip_without_dim + coeff * rotated_buf[i];
+                        float cand_norm_sq = norm_sq_without_dim + coeff * coeff;
+                        if (cand_ip * cand_ip * best_norm_sq > best_ip * best_ip * cand_norm_sq) {
+                            best_level = try_level;
+                            best_ip = cand_ip;
+                            best_norm_sq = cand_norm_sq;
                         }
                     }
                 } else {
                     // 1-2 bit: exhaustive search
                     for (int u = 0; u <= ki; ++u) {
-                        if (u == old_u) continue;
-                        float c = (2.0f * u - kf) / kf;
-                        float new_dot = dot_without + c * rotated_buf[i];
-                        float new_norm = norm_without + c * c;
-                        if (new_dot * new_dot * best_norm > best_dot * best_dot * new_norm) {
-                            best_u = u;
-                            best_dot = new_dot;
-                            best_norm = new_norm;
+                        if (u == old_level) continue;
+                        float coeff = (2.0f * u - kf) / kf;
+                        float cand_ip = ip_without_dim + coeff * rotated_buf[i];
+                        float cand_norm_sq = norm_sq_without_dim + coeff * coeff;
+                        if (cand_ip * cand_ip * best_norm_sq > best_ip * best_ip * cand_norm_sq) {
+                            best_level = u;
+                            best_ip = cand_ip;
+                            best_norm_sq = cand_norm_sq;
                         }
                     }
                 }
-                if (best_u != old_u) {
-                    float new_c = (2.0f * best_u - kf) / kf;
-                    dot_co = dot_without + new_c * rotated_buf[i];
-                    norm_c_sq = norm_without + new_c * new_c;
-                    codes_arr[i] = best_u;
+                if (best_level != old_level) {
+                    float new_coeff = (2.0f * best_level - kf) / kf;
+                    code_vec_ip = ip_without_dim + new_coeff * rotated_buf[i];
+                    code_norm_sq = norm_sq_without_dim + new_coeff * new_coeff;
+                    levels[i] = best_level;
                     changed = true;
                 }
             }
             if (!changed) break;
-            float cos_sq = dot_co * dot_co / norm_c_sq;
-            if (iter > 0 && (cos_sq - prev_cos_sq) < 1.0f / (K * K)) break;
-            prev_cos_sq = cos_sq;
+            float cosine_sq = code_vec_ip * code_vec_ip / code_norm_sq;
+            if (iter > 0 && (cosine_sq - prev_cosine_sq) < 1.0f / (K * K)) break;
+            prev_cosine_sq = cosine_sq;
         }
 
-        float ip_qo = 0.0f;
-        float ip_cp = 0.0f;
+        float code_ip = 0.0f;
+        float code_parent_ip = 0.0f;
         for (size_t i = 0; i < pd; ++i) {
             float kf = k_float_[i];
-            out_code.set_value(i, static_cast<uint8_t>(codes_arr[i]));
-            float c = (2.0f * codes_arr[i] - kf) / kf;
-            ip_qo += c * rotated_buf[i];
-            if (rotated_parent) ip_cp += c * rotated_parent[i];
+            out_code.set_value(i, static_cast<uint8_t>(levels[i]));
+            float coeff = (2.0f * levels[i] - kf) / kf;
+            code_ip += c * rotated_buf[i];
+            if (rotated_parent) code_parent_ip += coeff * rotated_parent[i];
         }
-        if (out_ip_cp) *out_ip_cp = ip_cp * inv_sqrt_d_;
-        return ip_qo * inv_sqrt_d_;
+        if (out_code_parent_ip) *out_code_parent_ip = code_parent_ip * inv_sqrt_d_;
+        return code_ip * inv_sqrt_d_;
     }
 };
 

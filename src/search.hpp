@@ -154,10 +154,10 @@ std::vector<SearchResult> search(
     beam.push({ep_est, 0.0f, ep});
     visited.check_and_mark_estimated(ep, query_id);
 
-    alignas(64) uint32_t fastscan_sums[GRAPH_DEGREE];
-    alignas(64) uint32_t msb_sums[GRAPH_DEGREE];
-    alignas(64) float est_distances[GRAPH_DEGREE];
-    alignas(64) float lower_bounds[GRAPH_DEGREE];
+    alignas(SIMD_ALIGNMENT) uint32_t fastscan_sums[GRAPH_DEGREE];
+    alignas(SIMD_ALIGNMENT) uint32_t msb_sums[GRAPH_DEGREE];
+    alignas(SIMD_ALIGNMENT) float est_distances[GRAPH_DEGREE];
+    alignas(SIMD_ALIGNMENT) float lower_bounds[GRAPH_DEGREE];
 
     while (!beam.empty()) {
         BeamEntry current;
@@ -216,8 +216,8 @@ std::vector<SearchResult> search(
                     query.lut, nb.code_blocks[batch], msb_sums + batch_start);
                 fastscan::convert_msb_to_lower_bounds<D, BitWidth>(
                     query, msb_sums + batch_start,
-                    nb.nop + batch_start, nb.ip_qo + batch_start,
-                    nb.ip_cp + batch_start, nb.popcounts + batch_start,
+                    nb.centered_norm + batch_start, nb.code_ip + batch_start,
+                    nb.code_parent_ip + batch_start, nb.popcounts + batch_start,
                     batch_count, lower_bounds + batch_start, dist_qp_sq);
 
                 float threshold = nn.worst_distance();
@@ -238,8 +238,8 @@ std::vector<SearchResult> search(
                     fastscan::convert_nbit_to_distances_with_bounds<D, BitWidth>(
                         query, fastscan_sums + batch_start,
                         msb_sums + batch_start,
-                        nb.nop + batch_start, nb.ip_qo + batch_start,
-                        nb.ip_cp + batch_start, nb.popcounts + batch_start,
+                        nb.centered_norm + batch_start, nb.code_ip + batch_start,
+                        nb.code_parent_ip + batch_start, nb.popcounts + batch_start,
                         nb.weighted_popcounts + batch_start,
                         batch_count, est_distances + batch_start,
                         lower_bounds + batch_start, dist_qp_sq);
@@ -256,8 +256,8 @@ std::vector<SearchResult> search(
                 fastscan::convert_nbit_to_distances_with_bounds<D, BitWidth>(
                     query, fastscan_sums + batch_start,
                     msb_sums + batch_start,
-                    nb.nop + batch_start, nb.ip_qo + batch_start,
-                    nb.ip_cp + batch_start, nb.popcounts + batch_start,
+                    nb.centered_norm + batch_start, nb.code_ip + batch_start,
+                    nb.code_parent_ip + batch_start, nb.popcounts + batch_start,
                     nb.weighted_popcounts + batch_start,
                     batch_count, est_distances + batch_start,
                     lower_bounds + batch_start, dist_qp_sq);

@@ -2,6 +2,8 @@
 build/
 build-ext/
 cmake-build-*/
+CMakeFiles/
+CMakeCache.txt
 *.o
 *.a
 *.so
