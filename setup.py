@@ -42,6 +42,6 @@ class CMakeBuild(build_ext):
 
 
 setup(
-    ext_modules=[CMakeExtension("cphnsw._core")],
+    ext_modules=[CMakeExtension("evtq._core")],
     cmdclass={"build_ext": CMakeBuild},
 )

@@ -13,7 +13,7 @@
 #include <immintrin.h>
 #include <omp.h>
 
-namespace cphnsw {
+namespace evtq {
 
 // ============================================================
 // Fast Hadamard Transform

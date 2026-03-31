@@ -9,7 +9,7 @@
 #include <algorithm>
 #include <limits>
 
-namespace cphnsw {
+namespace evtq {
 
 // ============================================================
 // Two-Level Visitation Table
@@ -173,7 +173,7 @@ std::vector<SearchResult> search(
         if (!found) break;
 
 
-        if (nn.size() >= k && current.est_distance >= gamma_q * nn.worst_distance()) [[unlikely]] break;
+        if (nn.size() >= k && current.est_distance > gamma_q * nn.worst_distance()) [[unlikely]] break;
 
         if (nn.size() >= k && current.lower_bound > nn.worst_distance()) continue;
 

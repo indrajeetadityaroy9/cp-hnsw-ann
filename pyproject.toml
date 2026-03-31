@@ -3,7 +3,7 @@ requires = ["setuptools==75.8.0", "pybind11==2.13.6", "cmake==3.30.5"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "cphnsw"
+name = "evtq"
 version = "0.1.0"
 requires-python = ">=3.12"
 dependencies = [
@@ -14,7 +14,7 @@ dependencies = [
 ]
 
 [project.scripts]
-cphnsw-eval = "cphnsw.__main__:main"
+evtq-eval = "evtq.__main__:main"
 
 [tool.setuptools]
-packages = ["cphnsw"]
+packages = ["evtq"]

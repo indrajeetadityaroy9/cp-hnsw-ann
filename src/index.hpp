@@ -16,7 +16,7 @@
 
 #include <omp.h>
 
-namespace cphnsw {
+namespace evtq {
 
 template <size_t D, size_t BitWidth = 1>
 class Index {
@@ -72,7 +72,7 @@ public:
 
         QueryType encoded = encoder_.encode_query_raw(query_vec);
         encoded.dot_slack = calibration_.dot_slack;
-        float gamma = 1.0f + calibration_.gamma_eff;
+        float gamma = calibration_.gamma;
 
         thread_local TwoLevelVisitationTable visited(0);
         if (visited.capacity() < graph_.size()) {

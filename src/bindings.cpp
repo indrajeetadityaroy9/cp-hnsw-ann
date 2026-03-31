@@ -12,7 +12,7 @@
 #include <omp.h>
 
 namespace py = pybind11;
-using namespace cphnsw;
+using namespace evtq;
 
 class PyIndexBase {
 public:
@@ -100,9 +100,9 @@ static std::unique_ptr<PyIndexBase> create_index(size_t dim, size_t bits) {
 }
 
 PYBIND11_MODULE(_core, m) {
-    m.doc() = "Calibration-Parameterless HNSW (CP-HNSW)";
+    m.doc() = "EVT-calibrated quantized graph search (EVTQ)";
 
-    py::class_<PyIndexBase>(m, "CPIndex")
+    py::class_<PyIndexBase>(m, "EVTQIndex")
         .def(py::init([](size_t dim, size_t bits) {
                 return create_index(dim, bits);
             }),

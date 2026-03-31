@@ -12,7 +12,7 @@
 
 #include <omp.h>
 
-namespace cphnsw {
+namespace evtq {
 
 // ============================================================
 // Neighbor Selection

@@ -6,7 +6,7 @@
 #include <vector>
 #include <limits>
 
-namespace cphnsw {
+namespace evtq {
 
 struct Segment {
     size_t start;

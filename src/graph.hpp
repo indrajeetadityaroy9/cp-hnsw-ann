@@ -9,7 +9,7 @@
 
 #include <omp.h>
 
-namespace cphnsw {
+namespace evtq {
 
 
 template <size_t D, size_t BitWidth = 1>

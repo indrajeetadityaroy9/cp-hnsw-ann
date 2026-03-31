@@ -8,7 +8,7 @@ from pathlib import Path
 import numpy as np
 import psutil
 
-import cphnsw
+import evtq
 from benchmarks.datasets import load_dataset
 
 BIT_WIDTHS = [1, 2, 4]
@@ -39,7 +39,7 @@ def run_benchmark(repo_id: str,
         rss_before = psutil.Process().memory_info().rss / BYTES_PER_MB
         t0 = time.perf_counter()
 
-        index = cphnsw.CPIndex(dim=dim, bits=bits)
+        index = evtq.EVTQIndex(dim=dim, bits=bits)
         index.build(base)
         index.finalize()
 
@@ -64,7 +64,7 @@ def run_benchmark(repo_id: str,
         med_time = float(np.median(times))
 
         results.append({
-            "algorithm": f"cphnsw-{bits}bit",
+            "algorithm": f"evtq-{bits}bit",
             "build_time_s": round(build_time, 2),
             "memory_mb": round(mem_mb, 1),
             "recall_at_10": round(recall_at_k(ids, gt, min(k, 10)), 4),

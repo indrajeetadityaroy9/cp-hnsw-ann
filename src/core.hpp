@@ -8,7 +8,7 @@
 
 #include <immintrin.h>
 
-namespace cphnsw {
+namespace evtq {
 
 using NodeId = uint32_t;
 constexpr NodeId INVALID_NODE = 0xFFFFFFFF;

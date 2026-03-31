@@ -8,7 +8,7 @@
 
 #include <immintrin.h>
 
-namespace cphnsw {
+namespace evtq {
 
 template <size_t D>
 struct FastScanCodeBlock {
