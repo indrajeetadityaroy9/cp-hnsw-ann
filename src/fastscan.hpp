@@ -26,7 +26,6 @@ struct FastScanCodeBlock {
         }
     }
 
-private:
     static uint8_t extract_sub_segment(const BinaryCodeStorage<D>& code, size_t seg_idx) {
         size_t bit_start = seg_idx * 4;
         uint8_t result = 0;
@@ -37,12 +36,12 @@ private:
     }
 };
 
-template <size_t D, size_t BitWidth>
+template <size_t D>
 struct NbitFastScanCodeBlock {
-    FastScanCodeBlock<D> planes[BitWidth];
+    FastScanCodeBlock<D> planes[BIT_WIDTH];
 
-    void store(size_t idx, const NbitCodeStorage<D, BitWidth>& code) {
-        for (size_t b = 0; b < BitWidth; ++b) {
+    void store(size_t idx, const NbitCodeStorage<D>& code) {
+        for (size_t b = 0; b < BIT_WIDTH; ++b) {
             BinaryCodeStorage<D> plane_binary;
             std::memcpy(plane_binary.signs, code.planes[b],
                         BinaryCodeStorage<D>::NUM_WORDS * sizeof(uint64_t));
@@ -51,11 +50,11 @@ struct NbitFastScanCodeBlock {
     }
 };
 
-template <size_t D, size_t BitWidth>
+template <size_t D>
 struct NbitFastScanNeighborBlock {
     static constexpr size_t NUM_BATCHES = GRAPH_DEGREE / 32;
 
-    NbitFastScanCodeBlock<D, BitWidth> code_blocks[NUM_BATCHES];
+    NbitFastScanCodeBlock<D> code_blocks[NUM_BATCHES];
     alignas(SIMD_ALIGNMENT) float centered_norm[GRAPH_DEGREE];
     alignas(SIMD_ALIGNMENT) float code_ip[GRAPH_DEGREE];
     alignas(SIMD_ALIGNMENT) float code_parent_ip[GRAPH_DEGREE];
@@ -73,9 +72,7 @@ struct NbitFastScanNeighborBlock {
         std::memset(weighted_popcounts, 0, sizeof(weighted_popcounts));
     }
 
-    void set_neighbor(size_t slot, uint32_t id,
-                      const NbitCodeStorage<D, BitWidth>& code,
-                      const VertexAuxData& aux_data) {
+    void set_neighbor(size_t slot, uint32_t id, const NbitCodeStorage<D>& code, const VertexAuxData& aux_data) {
         neighbor_ids[slot] = id;
         code_blocks[slot / 32].store(slot % 32, code);
         centered_norm[slot] = aux_data.centered_norm;
@@ -106,11 +103,7 @@ inline __m512 rcp_nr(__m512 d) {
 #endif
 
 template <size_t D>
-inline void compute_inner_products(
-    const uint8_t lut[][16],
-    const FastScanCodeBlock<D>& block,
-    uint32_t* __restrict__ out)
-{
+inline void compute_inner_products(const uint8_t lut[][16], const FastScanCodeBlock<D>& block, uint32_t* __restrict__ out) {
     constexpr size_t NUM_SUB_PAIRS = FastScanCodeBlock<D>::NUM_SUB_PAIRS;
     constexpr size_t NUM_SUB_SEGMENTS = FastScanCodeBlock<D>::NUM_SUB_SEGMENTS;
     constexpr size_t FLUSH = std::numeric_limits<uint8_t>::max()
@@ -159,20 +152,15 @@ inline void compute_inner_products(
         _mm256_cvtepu16_epi32(_mm256_extracti128_si256(acc_hi, 1)));
 }
 
-template <size_t D, size_t BitWidth>
-inline void compute_nbit_inner_products(
-    const uint8_t lut[][16],
-    const NbitFastScanCodeBlock<D, BitWidth>& block,
-    uint32_t* __restrict__ out_nbit,
-    uint32_t* __restrict__ out_msb)
-{
+template <size_t D>
+inline void compute_nbit_inner_products(const uint8_t lut[][16], const NbitFastScanCodeBlock<D>& block, uint32_t* __restrict__ out_nbit, uint32_t* __restrict__ out_msb) {
     std::memset(out_nbit, 0, 32 * sizeof(uint32_t));
     alignas(SIMD_ALIGNMENT) uint32_t plane_sums[32];
 
-    for (size_t b = 0; b < BitWidth; ++b) {
+    for (size_t b = 0; b < BIT_WIDTH; ++b) {
         compute_inner_products<D>(lut, block.planes[b], plane_sums);
         if (b == 0) std::memcpy(out_msb, plane_sums, 32 * sizeof(uint32_t));
-        __m256i vweight = _mm256_set1_epi32(1u << (BitWidth - 1 - b));
+        __m256i vweight = _mm256_set1_epi32(1u << (BIT_WIDTH - 1 - b));
         for (size_t i = 0; i < 32; i += 8) {
             __m256i vout = _mm256_load_si256(reinterpret_cast<const __m256i*>(out_nbit + i));
             __m256i vplane = _mm256_load_si256(reinterpret_cast<const __m256i*>(plane_sums + i));
@@ -182,22 +170,9 @@ inline void compute_nbit_inner_products(
     }
 }
 
-template <size_t D, size_t BitWidth>
-inline void convert_nbit_to_distances_with_bounds(
-    const RaBitQQuery<D>& query,
-    const uint32_t* nbit_fastscan_sums,
-    const uint32_t* msb_fastscan_sums,
-    const float* centered_norm_arr,
-    const float* code_ip_arr,
-    const float* code_parent_ip_arr,
-    const uint16_t* msb_popcounts,
-    const uint16_t* weighted_popcounts,
-    size_t count,
-    float* __restrict__ out_dist,
-    float* __restrict__ out_lower,
-    float dist_qp_sq)
-{
-    constexpr float inv_K = 1.0f / static_cast<float>((1u << BitWidth) - 1);
+template <size_t D>
+inline void convert_nbit_to_distances_with_bounds(const RaBitQQuery<D>& query, const uint32_t* nbit_fastscan_sums, const uint32_t* msb_fastscan_sums, const float* centered_norm_arr, const float* code_ip_arr, const float* code_parent_ip_arr, const uint16_t* msb_popcounts, const uint16_t* weighted_popcounts, size_t count, float* __restrict__ out_dist, float* __restrict__ out_lower, float dist_qp_sq) {
+    constexpr float inv_K = 1.0f / static_cast<float>((1u << BIT_WIDTH) - 1);
 
     const float A_nbit = query.coeff_fastscan * inv_K;
     const float B_nbit = query.coeff_popcount * inv_K;
@@ -315,15 +290,11 @@ inline void convert_nbit_to_distances_with_bounds(
     }
 }
 
-template <size_t D, size_t BitWidth>
-inline void compute_msb_only_inner_products(
-    const uint8_t lut[][16],
-    const NbitFastScanCodeBlock<D, BitWidth>& block,
-    uint32_t* __restrict__ out_msb)
-{
+template <size_t D>
+inline void compute_msb_only_inner_products(const uint8_t lut[][16], const NbitFastScanCodeBlock<D>& block, uint32_t* __restrict__ out_msb) {
     compute_inner_products<D>(lut, block.planes[0], out_msb);
 
-    if constexpr (BitWidth >= 2) {
+    {
         alignas(SIMD_ALIGNMENT) uint32_t plane1_sums[32];
         compute_inner_products<D>(lut, block.planes[1], plane1_sums);
         for (size_t i = 0; i < 32; i += 8) {
@@ -335,19 +306,9 @@ inline void compute_msb_only_inner_products(
     }
 }
 
-template <size_t D, size_t BitWidth>
-inline void convert_msb_to_lower_bounds(
-    const RaBitQQuery<D>& query,
-    const uint32_t* msb_fastscan_sums,
-    const float* centered_norm_arr,
-    const float* code_ip_arr,
-    const float* code_parent_ip_arr,
-    const uint16_t* msb_popcounts,
-    size_t count,
-    float* __restrict__ out_lower,
-    float dist_qp_sq)
-{
-    constexpr float INV_K_PARTIAL = 1.0f / static_cast<float>((1 << std::min(BitWidth, size_t(2))) - 1);
+template <size_t D>
+inline void convert_msb_to_lower_bounds(const RaBitQQuery<D>& query, const uint32_t* msb_fastscan_sums, const float* centered_norm_arr, const float* code_ip_arr, const float* code_parent_ip_arr, const uint16_t* msb_popcounts, size_t count, float* __restrict__ out_lower, float dist_qp_sq) {
+    constexpr float INV_K_PARTIAL = 1.0f / static_cast<float>((1 << std::min(BIT_WIDTH, size_t(2))) - 1);
 
     const float A = query.coeff_fastscan * INV_K_PARTIAL;
     const float B = query.coeff_popcount * INV_K_PARTIAL;

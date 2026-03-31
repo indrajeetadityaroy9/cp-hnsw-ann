@@ -1,5 +1,3 @@
-"""Benchmark evaluation library."""
-
 import gc
 import json
 import time
@@ -11,7 +9,6 @@ import psutil
 import evtq
 from benchmarks.datasets import load_dataset
 
-BIT_WIDTHS = [1, 2, 4]
 BYTES_PER_MB = 1024 ** 2
 
 
@@ -32,47 +29,44 @@ def run_benchmark(repo_id: str,
     dim = ds["dim"]
     dataset_name = repo_id.split("/")[-1]
 
-    results = []
+    gc.collect()
+    rss_before = psutil.Process().memory_info().rss / BYTES_PER_MB
+    t0 = time.perf_counter()
 
-    for bits in BIT_WIDTHS:
-        gc.collect()
-        rss_before = psutil.Process().memory_info().rss / BYTES_PER_MB
+    index = evtq.EVTQIndex(dim=dim)
+    index.build(base)
+    index.finalize()
+
+    build_time = time.perf_counter() - t0
+    gc.collect()
+    rss_after = psutil.Process().memory_info().rss / BYTES_PER_MB
+    mem_mb = rss_after - rss_before
+
+    def search_fn(batch):
+        ids, _ = index.search_batch(batch, k=k)
+        return np.asarray(ids)
+
+    search_fn(queries)
+    times = []
+    t0 = time.perf_counter()
+    ids = search_fn(queries)
+    times.append(time.perf_counter() - t0)
+    for _ in range(n_runs - 1):
         t0 = time.perf_counter()
-
-        index = evtq.EVTQIndex(dim=dim, bits=bits)
-        index.build(base)
-        index.finalize()
-
-        build_time = time.perf_counter() - t0
-        gc.collect()
-        rss_after = psutil.Process().memory_info().rss / BYTES_PER_MB
-        mem_mb = rss_after - rss_before
-
-        def search_fn(batch):
-            ids, _ = index.search_batch(batch, k=k)
-            return np.asarray(ids)
-
         search_fn(queries)
-        times = []
-        t0 = time.perf_counter()
-        ids = search_fn(queries)
         times.append(time.perf_counter() - t0)
-        for _ in range(n_runs - 1):
-            t0 = time.perf_counter()
-            search_fn(queries)
-            times.append(time.perf_counter() - t0)
-        med_time = float(np.median(times))
+    med_time = float(np.median(times))
 
-        results.append({
-            "algorithm": f"evtq-{bits}bit",
-            "build_time_s": round(build_time, 2),
-            "memory_mb": round(mem_mb, 1),
-            "recall_at_10": round(recall_at_k(ids, gt, min(k, 10)), 4),
-            "qps": round(len(queries) / med_time, 1),
-        })
+    results = [{
+        "algorithm": "evtq",
+        "build_time_s": round(build_time, 2),
+        "memory_mb": round(mem_mb, 1),
+        "recall_at_10": round(recall_at_k(ids, gt, min(k, 10)), 4),
+        "qps": round(len(queries) / med_time, 1),
+    }]
 
-        del index
-        gc.collect()
+    del index
+    gc.collect()
 
     output = {
         "metadata": {

@@ -1,0 +1,16 @@
+run:
+  output_dir: results
+
+data:
+  datasets:
+    - huggingface:datasets/sift100m
+    - huggingface:datasets/sift10m
+    - huggingface:datasets/sift1m
+    - huggingface:datasets/sift100k
+    - huggingface:datasets/sift10k
+    - huggingface:datasets/sift1k
+    - huggingface:datasets/sift100
+
+eval:
+  k: 100
+  n_runs: 3

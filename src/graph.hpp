@@ -2,29 +2,30 @@
 
 #include "core.hpp"
 #include "fastscan.hpp"
-#include <vector>
+#include <algorithm>
 #include <array>
+#include <cmath>
 #include <queue>
-#include <cstring>
+#include <span>
+#include <vector>
 
 #include <omp.h>
 
 namespace evtq {
 
 
-template <size_t D, size_t BitWidth = 1>
+template <size_t D>
 struct alignas(SIMD_ALIGNMENT) VertexSearchData {
-    using CodeType = NbitRaBitQCode<D, BitWidth>;
-    using NeighborBlockType = NbitFastScanNeighborBlock<D, BitWidth>;
+    using CodeType = NbitRaBitQCode<D>;
+    using NeighborBlockType = NbitFastScanNeighborBlock<D>;
 
     CodeType code;
     NeighborBlockType neighbors;
 };
 
-template <size_t D, size_t BitWidth = 1>
-class RaBitQGraph {
-public:
-    using SearchDataType = VertexSearchData<D, BitWidth>;
+template <size_t D>
+struct RaBitQGraph {
+    using SearchDataType = VertexSearchData<D>;
     using CodeType = typename SearchDataType::CodeType;
     using NeighborBlockType = typename SearchDataType::NeighborBlockType;
     using RawVector = std::array<float, D>;
@@ -40,15 +41,15 @@ public:
     RaBitQGraph(RaBitQGraph&&) = default;
     RaBitQGraph& operator=(RaBitQGraph&&) = default;
 
-    NodeId add_node(const CodeType& code, const float* vec) {
+    NodeId add_node(const CodeType& code, std::span<const float> vec) {
         NodeId id = static_cast<NodeId>(search_data_.size());
         search_data_.emplace_back();
         search_data_.back().code = code;
 
         raw_vectors_.emplace_back();
-        std::memcpy(raw_vectors_.back().data(), vec, dim_ * sizeof(float));
+        std::copy_n(vec.data(), dim_, raw_vectors_.back().data());
         if (dim_ < D) {
-            std::memset(raw_vectors_.back().data() + dim_, 0, (D - dim_) * sizeof(float));
+            std::fill_n(raw_vectors_.back().data() + dim_, D - dim_, 0.0f);
         }
 
         const float* stored = raw_vectors_.back().data();
@@ -81,12 +82,7 @@ public:
         return norm_sq_;
     }
 
-    void restore_from_serialized(
-        std::vector<SearchDataType, AlignedAllocator<SearchDataType>> sd,
-        std::vector<RawVector> rv,
-        AlignedVector<float> ns,
-        NodeId ep)
-    {
+    void restore_from_serialized(std::vector<SearchDataType, AlignedAllocator<SearchDataType>> sd, std::vector<RawVector> rv, AlignedVector<float> ns, NodeId ep) {
         search_data_ = std::move(sd);
         raw_vectors_ = std::move(rv);
         norm_sq_ = std::move(ns);
@@ -98,6 +94,15 @@ public:
     const float* get_vector(NodeId id) const { return raw_vectors_[id].data(); }
 
     float get_norm_sq(NodeId id) const { return norm_sq_[id]; }
+
+    float distance_between(NodeId a, NodeId b) const {
+        return l2_distance_simd<D>(raw_vectors_[a].data(), raw_vectors_[b].data());
+    }
+
+    float query_distance(const float* query, float query_norm_sq, NodeId id) const {
+        return query_norm_sq + norm_sq_[id]
+               - 2.0f * dot_product_simd<D>(query, raw_vectors_[id].data());
+    }
 
     void prefetch_norm(NodeId id) const {
         prefetch_t<1>(&norm_sq_[id]);
@@ -111,12 +116,8 @@ public:
         return search_data_[id].neighbors;
     }
 
-    // Prefetch the vertex code + first batch of packed neighbor codes.
-    // sizeof(CodeType) covers the vertex's own quantization data;
-    // sizeof(NbitFastScanCodeBlock<D,BitWidth>) covers one batch of 32 packed neighbor codes.
-    // Cap to avoid saturating the prefetch queue for large D.
     static constexpr size_t FIRST_BATCH_BYTES =
-        sizeof(CodeType) + sizeof(NbitFastScanCodeBlock<D, BitWidth>);
+        sizeof(CodeType) + sizeof(NbitFastScanCodeBlock<D>);
     static constexpr size_t MAX_USEFUL_LINES =
         (FIRST_BATCH_BYTES + CACHE_LINE_SIZE - 1) / CACHE_LINE_SIZE;
     static constexpr size_t TOTAL_VERTEX_LINES =
@@ -134,8 +135,6 @@ public:
     void prefetch_vector(NodeId id) const {
         const char* base = reinterpret_cast<const char*>(raw_vectors_[id].data());
         constexpr size_t VEC_LINES = (D * sizeof(float) + CACHE_LINE_SIZE - 1) / CACHE_LINE_SIZE;
-        // Prefetch enough for the first SIMD iteration of dot_product_simd (32 floats = 128 bytes = 2 lines)
-        // plus headroom for the second iteration.
         constexpr size_t DOT_FIRST_ITER_LINES = (32 * sizeof(float) + CACHE_LINE_SIZE - 1) / CACHE_LINE_SIZE;
         constexpr size_t MAX_VEC_LINES = (VEC_LINES < 2 * DOT_FIRST_ITER_LINES)
             ? VEC_LINES : 2 * DOT_FIRST_ITER_LINES;
@@ -144,21 +143,7 @@ public:
         }
     }
 
-    std::vector<double> compute_centroid() const {
-        size_t n = raw_vectors_.size();
-        std::vector<double> centroid(dim_, 0.0);
-        for (size_t i = 0; i < n; ++i) {
-            const float* v = raw_vectors_[i].data();
-            for (size_t j = 0; j < dim_; ++j) {
-                centroid[j] += v[j];
-            }
-        }
-        double inv_n = 1.0 / static_cast<double>(n);
-        for (size_t j = 0; j < dim_; ++j) centroid[j] *= inv_n;
-        return centroid;
-    }
-
-    std::vector<NodeId> reorder_bfs(NodeId entry) {
+    void reorder_bfs(NodeId entry) {
         size_t n = search_data_.size();
         std::vector<NodeId> perm(n, INVALID_NODE);
         std::vector<NodeId> new_to_old(n);
@@ -222,11 +207,9 @@ public:
         norm_sq_ = std::move(new_norms);
 
         entry_point_ = perm[entry_point_];
-
-        return perm;
     }
 
-    NodeId find_hub_entry(const std::vector<double>& centroid) const {
+    NodeId find_hub_entry(const float* centroid) const {
         size_t n = raw_vectors_.size();
 
         struct CentroidDist {
@@ -235,16 +218,13 @@ public:
             bool operator<(const CentroidDist& o) const { return dist < o.dist; }
         };
 
-        alignas(SIMD_ALIGNMENT) float centroid_f[D];
-        centroid_to_float(centroid, centroid_f);
-
         size_t top_k = std::max<size_t>(1, static_cast<size_t>(std::sqrt(static_cast<double>(n))));
         std::vector<CentroidDist> dists(n);
 
         #pragma omp parallel for schedule(static)
         for (size_t i = 0; i < n; ++i) {
             dists[i] = {static_cast<NodeId>(i),
-                        l2_distance_simd<D>(raw_vectors_[i].data(), centroid_f)};
+                        l2_distance_simd<D>(raw_vectors_[i].data(), centroid)};
         }
 
         std::partial_sort(dists.begin(), dists.begin() + top_k, dists.end());
@@ -262,17 +242,11 @@ public:
         return best;
     }
 
-private:
     size_t dim_;
     std::vector<SearchDataType, AlignedAllocator<SearchDataType>> search_data_;
     std::vector<RawVector> raw_vectors_;
     AlignedVector<float> norm_sq_;
     NodeId entry_point_ = INVALID_NODE;
-
-    void centroid_to_float(const std::vector<double>& centroid, float* out) const {
-        for (size_t j = 0; j < dim_; ++j) out[j] = static_cast<float>(centroid[j]);
-        for (size_t j = dim_; j < D; ++j) out[j] = 0.0f;
-    }
 };
 
 }

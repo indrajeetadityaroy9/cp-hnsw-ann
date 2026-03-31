@@ -6,27 +6,25 @@
 #include "graph.hpp"
 #include "graph_build.hpp"
 #include "search.hpp"
-#include <vector>
-#include <cmath>
+#include <algorithm>
+#include <fstream>
 #include <mutex>
 #include <shared_mutex>
-#include <cstring>
-#include <fstream>
+#include <span>
 #include <string>
+#include <vector>
 
 #include <omp.h>
 
 namespace evtq {
 
-template <size_t D, size_t BitWidth = 1>
-class Index {
-public:
-    using CodeType = NbitRaBitQCode<D, BitWidth>;
+template <size_t D>
+struct Index {
+    using CodeType = NbitRaBitQCode<D>;
     using QueryType = RaBitQQuery<D>;
-    using Encoder = NbitRaBitQEncoder<D, BitWidth>;
-    using Graph = RaBitQGraph<D, BitWidth>;
+    using Encoder = NbitRaBitQEncoder<D>;
+    using Graph = RaBitQGraph<D>;
     static constexpr size_t DIMS = D;
-    static constexpr size_t BIT_WIDTH = BitWidth;
 
     explicit Index(size_t dim)
         : dim_(dim)
@@ -34,7 +32,7 @@ public:
         , graph_(dim)
     {}
 
-    void build(const float* vecs, size_t num_vecs) {
+    void build(std::span<const float> vecs, size_t num_vecs) {
         std::unique_lock<std::shared_mutex> lock(index_mutex_);
 
         graph_ = Graph(dim_);
@@ -43,10 +41,10 @@ public:
         graph_.reserve(num_vecs);
 
         std::vector<CodeType> codes(num_vecs);
-        encoder_.encode_batch(vecs, num_vecs, codes.data());
+        encoder_.encode_batch(vecs.data(), num_vecs, codes.data());
 
         for (size_t i = 0; i < num_vecs; ++i) {
-            graph_.add_node(codes[i], vecs + i * dim_);
+            graph_.add_node(codes[i], vecs.subspan(i * dim_, dim_));
         }
     }
 
@@ -57,16 +55,16 @@ public:
     }
 
     std::vector<SearchResult> search(
-        const float* query,
+        std::span<const float> query,
         size_t k) const
     {
         std::shared_lock<std::shared_mutex> lock(index_mutex_);
 
         thread_local AlignedVector<float> query_padded;
         query_padded.resize(D);
-        std::memcpy(query_padded.data(), query, dim_ * sizeof(float));
+        std::copy_n(query.data(), dim_, query_padded.data());
         if (dim_ < D) {
-            std::memset(query_padded.data() + dim_, 0, (D - dim_) * sizeof(float));
+            std::fill_n(query_padded.data() + dim_, D - dim_, 0.0f);
         }
         const float* query_vec = query_padded.data();
 
@@ -80,7 +78,7 @@ public:
         }
 
         NodeId ep = graph_.entry_point();
-        return rabitq_search::search<D, BitWidth>(
+        return rabitq_search::search<D>(
             encoded, query_vec, graph_, k, gamma, visited, ep);
     }
 
@@ -166,7 +164,6 @@ public:
         calibration_ = new_calib;
     }
 
-private:
     size_t dim_;
     Encoder encoder_;
     Graph graph_;
@@ -174,25 +171,8 @@ private:
     mutable std::shared_mutex index_mutex_;
 
     void compute_calibration() {
-        // sigma_ratio = sqrt(pi/2 - 1): coefficient of variation of the
-        // half-normal distribution, from RaBitQ quantization error theory.
-        float sigma_ratio = std::sqrt(static_cast<float>(M_PI) / 2.0f - 1.0f);
-        float D_f = static_cast<float>(D);
-
-        const auto& segments = encoder_.get_segments();
-        const auto& var = encoder_.get_dim_variance();
-        float max_seg_weight = 0.0f;
-        for (const auto& seg : segments) {
-            float scale = static_cast<float>(1u << (2 * seg.bits));
-            float seg_var_sum = 0.0f;
-            for (size_t j = seg.start; j < seg.start + seg.len; ++j)
-                seg_var_sum += var[j];
-            float w = seg_var_sum / scale;
-            if (w > max_seg_weight) max_seg_weight = w;
-        }
-
-        float dot_slack = sigma_ratio * std::sqrt(max_seg_weight) / std::sqrt(D_f);
-        calibration_ = calibration::calibrate<D, BitWidth>(
+        float dot_slack = encoder_.compute_dot_slack();
+        calibration_ = calibration::calibrate<D>(
             graph_, encoder_, dot_slack);
     }
 };

@@ -1,5 +1,4 @@
-"""CMake-based build for pybind11 extension module."""
-
+import os
 import subprocess
 from pathlib import Path
 
@@ -20,7 +19,7 @@ class CMakeExtension(Extension):
 class CMakeBuild(build_ext):
     def build_extension(self, ext):
         extdir = Path(self.get_ext_fullpath(ext.name)).resolve().parent
-        cfg = "Release"
+        cfg = os.environ.get("CMAKE_BUILD_TYPE", "Release")
 
         cmake_args = [
             f"-DCMAKE_LIBRARY_OUTPUT_DIRECTORY={extdir}",
@@ -36,12 +35,12 @@ class CMakeBuild(build_ext):
             cwd=build_temp, check=True,
         )
         subprocess.run(
-            ["cmake", "--build", ".", "--config", cfg, "--target", "_core"],
+            ["cmake", "--build", ".", "--config", cfg, "--target", "evtq"],
             cwd=build_temp, check=True,
         )
 
 
 setup(
-    ext_modules=[CMakeExtension("evtq._core")],
+    ext_modules=[CMakeExtension("evtq")],
     cmdclass={"build_ext": CMakeBuild},
 )

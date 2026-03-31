@@ -1,5 +1,3 @@
-"""Dataset loaders for ANN benchmarks via Hugging Face Hub."""
-
 import tarfile
 from pathlib import Path
 

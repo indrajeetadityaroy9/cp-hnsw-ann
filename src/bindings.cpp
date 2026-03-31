@@ -6,7 +6,9 @@
 
 #include <limits>
 #include <memory>
+#include <span>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include <omp.h>
@@ -14,33 +16,31 @@
 namespace py = pybind11;
 using namespace evtq;
 
-class PyIndexBase {
-public:
+struct PyIndexBase {
     virtual ~PyIndexBase() = default;
 
-    virtual void build(const float* vecs, size_t n) = 0;
+    virtual void build(std::span<const float> vecs, size_t n) = 0;
     virtual void finalize() = 0;
 
     virtual size_t size() const = 0;
     virtual size_t dim() const = 0;
 
     virtual std::vector<SearchResult>
-    search_raw(const float* query, size_t k) const = 0;
+    search_raw(std::span<const float> query, size_t k) const = 0;
 
     virtual void save(const std::string& path) const = 0;
     virtual void load(const std::string& path) = 0;
 };
 
-template <size_t D, size_t BitWidth>
-class PyIndexWrapper : public PyIndexBase {
-public:
-    using IndexType = Index<D, BitWidth>;
+template <size_t D>
+struct PyIndexWrapper : PyIndexBase {
+    using IndexType = Index<D>;
 
     explicit PyIndexWrapper(size_t dim) {
         index_ = std::make_unique<IndexType>(dim);
     }
 
-    void build(const float* vecs, size_t n) override {
+    void build(std::span<const float> vecs, size_t n) override {
         index_->build(vecs, n);
     }
 
@@ -52,7 +52,7 @@ public:
     size_t dim() const override { return index_->dim(); }
 
     std::vector<SearchResult>
-    search_raw(const float* query, size_t k) const override {
+    search_raw(std::span<const float> query, size_t k) const override {
         return index_->search(query, k);
     }
 
@@ -64,16 +64,14 @@ public:
         index_->load(path);
     }
 
-private:
     std::unique_ptr<IndexType> index_;
 };
 
-template <size_t BitWidth>
-static std::unique_ptr<PyIndexBase> create_index_with_bits(size_t dim) {
+static std::unique_ptr<PyIndexBase> create_index(size_t dim) {
     size_t pd = next_power_of_two(dim);
 
 #define CASE_DIM(DIM) \
-    case DIM: return std::make_unique<PyIndexWrapper<DIM, BitWidth>>(dim);
+    case DIM: return std::make_unique<PyIndexWrapper<DIM>>(dim);
 
     switch (pd) {
         CASE_DIM(16)
@@ -84,39 +82,28 @@ static std::unique_ptr<PyIndexBase> create_index_with_bits(size_t dim) {
         CASE_DIM(512)
         CASE_DIM(1024)
         CASE_DIM(2048)
-        default: __builtin_unreachable();
+        default: std::unreachable();
     }
 
 #undef CASE_DIM
 }
 
-static std::unique_ptr<PyIndexBase> create_index(size_t dim, size_t bits) {
-    switch (bits) {
-        case 1: return create_index_with_bits<1>(dim);
-        case 2: return create_index_with_bits<2>(dim);
-        case 4: return create_index_with_bits<4>(dim);
-        default: __builtin_unreachable();
-    }
-}
-
-PYBIND11_MODULE(_core, m) {
-    m.doc() = "EVT-calibrated quantized graph search (EVTQ)";
-
+PYBIND11_MODULE(evtq, m) {
     py::class_<PyIndexBase>(m, "EVTQIndex")
-        .def(py::init([](size_t dim, size_t bits) {
-                return create_index(dim, bits);
+        .def(py::init([](size_t dim) {
+                return create_index(dim);
             }),
-            py::arg("dim"),
-            py::arg("bits") = 1)
+            py::arg("dim"))
 
         .def("build", [](PyIndexBase& self,
                           py::array_t<float, py::array::c_style | py::array::forcecast> vectors) {
             auto vbuf = vectors.request();
-            const float* vec_ptr = static_cast<const float*>(vbuf.ptr);
-            size_t n = static_cast<size_t>(vbuf.shape[0]);
+            auto vec_ptr = static_cast<const float*>(vbuf.ptr);
+            auto n = static_cast<size_t>(vbuf.shape[0]);
+            auto total = static_cast<size_t>(vbuf.size);
 
             py::gil_scoped_release release;
-            self.build(vec_ptr, n);
+            self.build(std::span<const float>{vec_ptr, total}, n);
         },
         py::arg("vectors"))
 
@@ -129,12 +116,13 @@ PYBIND11_MODULE(_core, m) {
                           py::array_t<float, py::array::c_style | py::array::forcecast> query,
                           size_t k) {
             auto buf = query.request();
-            const float* ptr = static_cast<const float*>(buf.ptr);
+            auto ptr = static_cast<const float*>(buf.ptr);
+            auto len = static_cast<size_t>(buf.size);
 
             std::vector<SearchResult> results;
             {
                 py::gil_scoped_release release;
-                results = self.search_raw(ptr, k);
+                results = self.search_raw(std::span<const float>{ptr, len}, k);
             }
 
             const size_t n = results.size();
@@ -155,9 +143,9 @@ PYBIND11_MODULE(_core, m) {
                                 py::array_t<float, py::array::c_style | py::array::forcecast> queries,
                                 size_t k) {
             auto buf = queries.request();
-            const size_t n = static_cast<size_t>(buf.shape[0]);
-            const float* ptr = static_cast<const float*>(buf.ptr);
-            const size_t dim = self.dim();
+            auto n = static_cast<size_t>(buf.shape[0]);
+            auto ptr = static_cast<const float*>(buf.ptr);
+            auto dim = self.dim();
 
             py::array_t<int64_t> ids({static_cast<py::ssize_t>(n), static_cast<py::ssize_t>(k)});
             py::array_t<float> distances({static_cast<py::ssize_t>(n), static_cast<py::ssize_t>(k)});
@@ -169,7 +157,8 @@ PYBIND11_MODULE(_core, m) {
                 const int actual_threads = omp_get_max_threads();
 #pragma omp parallel for schedule(guided) num_threads(actual_threads)
                 for (size_t i = 0; i < n; ++i) {
-                    auto results = self.search_raw(ptr + i * dim, k);
+                    auto results = self.search_raw(
+                        std::span<const float>{ptr + i * dim, dim}, k);
                     size_t j = 0;
                     for (; j < k && j < results.size(); ++j) {
                         ids_ptr[i * k + j] = static_cast<int64_t>(results[j].id);

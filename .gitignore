@@ -1,15 +1,14 @@
-# Build artifacts
 build/
 build-ext/
 cmake-build-*/
 CMakeFiles/
+CMakeUserPresets.json
 CMakeCache.txt
 *.o
 *.a
 *.so
 *.dylib
 
-# Python
 __pycache__/
 *.py[cod]
 *$py.class
@@ -20,7 +19,6 @@ wheels/
 *.whl
 .eggs/
 
-# Data (large binary files)
 data/
 *.fvecs
 *.ivecs
@@ -37,12 +35,10 @@ data/
 *.zip
 *.gz
 
-# Generated results
 results/
 checkpoints/
 *.csv
 
-# IDE
 .idea/
 .vscode/
 *.swp
@@ -50,11 +46,8 @@ checkpoints/
 *~
 .DS_Store
 
-# Papers (reference only, not source code)
 papers/
 analysis/
-
-# Misc
 *.tmp
 *.cache
 .cache/
@@ -62,8 +55,6 @@ analysis/
 .coverage
 .pytest_cache/
 .venv/
-
-# Secrets
 .env
 .env.*
 *.pem
