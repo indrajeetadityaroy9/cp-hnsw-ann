@@ -455,7 +455,7 @@ void optimize_graph_adaptive(RaBitQGraph<D>& graph, const EncType& encoder) {
         new_flags[i].assign(working[i].size(), 1);
     }
 
-    size_t total_edges = std::max(n * GRAPH_DEGREE, size_t(1));
+    size_t total_edges = n * GRAPH_DEGREE;
 
     size_t updates_0 = nndescent_join_pass<D>(
         graph, working, new_flags, actual_threads);

@@ -1,7 +1,6 @@
 #pragma once
 
 #include "core.hpp"
-#include "segmentation.hpp"
 #include <array>
 #include <climits>
 #include <cmath>
@@ -166,15 +165,10 @@ struct NbitRaBitQEncoder {
         float d_float = static_cast<float>(D);
         norm_factor_ = 1.0f / (d_float * std::sqrt(d_float));
         inv_sqrt_d_ = 1.0f / std::sqrt(d_float);
-        for (size_t i = 0; i < D; ++i) {
-            k_int_[i] = K_INT;
-            k_float_[i] = K;
-        }
     }
 
     void encode_batch(const float* vecs, size_t num_vecs, CodeType* codes) {
         compute_centroid(vecs, num_vecs);
-        compute_segmentation_from_data(vecs, num_vecs);
 
         #pragma omp parallel
         {
@@ -235,17 +229,8 @@ struct NbitRaBitQEncoder {
     }
 
     float compute_dot_slack() const {
-        float sigma_ratio = std::sqrt(static_cast<float>(M_PI) / 2.0f - 1.0f);
-        float max_seg_weight = 0.0f;
-        for (const auto& seg : segments_) {
-            float scale = static_cast<float>(1u << (2 * seg.bits));
-            float seg_var_sum = 0.0f;
-            for (size_t j = seg.start; j < seg.start + seg.len; ++j)
-                seg_var_sum += dim_variance_[j];
-            float w = seg_var_sum / scale;
-            if (w > max_seg_weight) max_seg_weight = w;
-        }
-        return sigma_ratio * std::sqrt(max_seg_weight) / std::sqrt(static_cast<float>(D));
+        return std::sqrt((static_cast<float>(M_PI) / 2.0f - 1.0f)
+                         / static_cast<float>((1u << (2 * BIT_WIDTH)) * D));
     }
 
     size_t dim_;
@@ -253,10 +238,6 @@ struct NbitRaBitQEncoder {
     float norm_factor_;
     float inv_sqrt_d_;
     std::vector<float> centroid_;
-    std::vector<Segment> segments_;
-    std::array<float, D> dim_variance_{};
-    std::array<int, D> k_int_;
-    std::array<float, D> k_float_;
 
     void compute_centroid(const float* vecs, size_t num_vecs) {
         centroid_.assign(dim_, 0.0f);
@@ -269,34 +250,6 @@ struct NbitRaBitQEncoder {
         float inv_n = 1.0f / static_cast<float>(num_vecs);
         for (size_t j = 0; j < dim_; ++j) {
             centroid_[j] *= inv_n;
-        }
-    }
-
-    void compute_segmentation_from_data(const float* vecs, size_t num_vecs) {
-        alignas(SIMD_ALIGNMENT) float var[D] = {};
-        AlignedVector<float> buf(D);
-        AlignedVector<float> centered(D);
-
-        for (size_t i = 0; i < num_vecs; ++i) {
-            center_and_normalize(vecs + i * dim_, centered.data());
-            rotate_and_normalize(centered.data(), buf.data());
-
-            for (size_t j = 0; j < D; ++j) var[j] += buf[j] * buf[j];
-        }
-
-        float inv_n = 1.0f / static_cast<float>(num_vecs);
-        for (size_t j = 0; j < D; ++j) {
-            var[j] *= inv_n;
-            dim_variance_[j] = var[j];
-        }
-
-        segments_ = compute_segmentation<D>(var, BIT_WIDTH * D);
-
-        for (const auto& seg : segments_) {
-            for (size_t i = seg.start; i < seg.start + seg.len; ++i) {
-                k_int_[i] = (1 << seg.bits) - 1;
-                k_float_[i] = static_cast<float>(k_int_[i]);
-            }
         }
     }
 
@@ -313,10 +266,7 @@ struct NbitRaBitQEncoder {
 
         float quantized_sum = 0.0f;
         for (size_t i = 0; i < D; ++i) {
-            float val = (buf[i] - lut_min) * inv_delta;
-            int u = static_cast<int>(val + 0.5f);
-            if (u < 0) u = 0;
-            if (u > static_cast<int>(LUT_LEVELS)) u = static_cast<int>(LUT_LEVELS);
+            int u = static_cast<int>((buf[i] - lut_min) * inv_delta + 0.5f);
             quantized_query[i] = static_cast<uint8_t>(u);
             quantized_sum += static_cast<float>(u);
         }
@@ -395,13 +345,9 @@ struct NbitRaBitQEncoder {
 
         float code_vec_ip = 0.0f, code_norm_sq = 0.0f;
         for (size_t i = 0; i < D; ++i) {
-            float kf = k_float_[i];
-            float val = (rotated_buf[i] - buf_min) * inv_range * kf;
-            int u = static_cast<int>(val + 0.5f);
-            if (u < 0) u = 0;
-            if (u > k_int_[i]) u = k_int_[i];
+            int u = static_cast<int>((rotated_buf[i] - buf_min) * inv_range * K + 0.5f);
             levels[i] = u;
-            float coeff = (2.0f * u - kf) / kf;
+            float coeff = (2.0f * u - K) / K;
             code_vec_ip += coeff * rotated_buf[i];
             code_norm_sq += coeff * coeff;
         }
@@ -410,43 +356,26 @@ struct NbitRaBitQEncoder {
         for (size_t iter = 0; ; ++iter) {
             bool changed = false;
             for (size_t i = 0; i < D; ++i) {
-                float kf = k_float_[i];
-                int ki = k_int_[i];
                 int old_level = levels[i];
-                float old_coeff = (2.0f * old_level - kf) / kf;
+                float old_coeff = (2.0f * old_level - K) / K;
                 float ip_without_dim = code_vec_ip - old_coeff * rotated_buf[i];
                 float norm_sq_without_dim = code_norm_sq - old_coeff * old_coeff;
                 int best_level = old_level;
                 float best_ip = code_vec_ip, best_norm_sq = code_norm_sq;
-                constexpr int DELTA_SEARCH_K = (1 << ALLOWED_BITS[NUM_ALLOWED_BITS - 1]) - 1;
-                if (ki >= DELTA_SEARCH_K) {
-                    for (int d : {-1, +1}) {
-                        int try_level = old_level + d;
-                        if (try_level < 0 || try_level > ki) continue;
-                        float coeff = (2.0f * try_level - kf) / kf;
-                        float cand_ip = ip_without_dim + coeff * rotated_buf[i];
-                        float cand_norm_sq = norm_sq_without_dim + coeff * coeff;
-                        if (cand_ip * cand_ip * best_norm_sq > best_ip * best_ip * cand_norm_sq) {
-                            best_level = try_level;
-                            best_ip = cand_ip;
-                            best_norm_sq = cand_norm_sq;
-                        }
-                    }
-                } else {
-                    for (int u = 0; u <= ki; ++u) {
-                        if (u == old_level) continue;
-                        float coeff = (2.0f * u - kf) / kf;
-                        float cand_ip = ip_without_dim + coeff * rotated_buf[i];
-                        float cand_norm_sq = norm_sq_without_dim + coeff * coeff;
-                        if (cand_ip * cand_ip * best_norm_sq > best_ip * best_ip * cand_norm_sq) {
-                            best_level = u;
-                            best_ip = cand_ip;
-                            best_norm_sq = cand_norm_sq;
-                        }
+                for (int d : {-1, +1}) {
+                    int try_level = old_level + d;
+                    if (try_level < 0 || try_level > K_INT) continue;
+                    float coeff = (2.0f * try_level - K) / K;
+                    float cand_ip = ip_without_dim + coeff * rotated_buf[i];
+                    float cand_norm_sq = norm_sq_without_dim + coeff * coeff;
+                    if (cand_ip * cand_ip * best_norm_sq > best_ip * best_ip * cand_norm_sq) {
+                        best_level = try_level;
+                        best_ip = cand_ip;
+                        best_norm_sq = cand_norm_sq;
                     }
                 }
                 if (best_level != old_level) {
-                    float new_coeff = (2.0f * best_level - kf) / kf;
+                    float new_coeff = (2.0f * best_level - K) / K;
                     code_vec_ip = ip_without_dim + new_coeff * rotated_buf[i];
                     code_norm_sq = norm_sq_without_dim + new_coeff * new_coeff;
                     levels[i] = best_level;
@@ -462,9 +391,8 @@ struct NbitRaBitQEncoder {
         float code_ip = 0.0f;
         float code_parent_ip = 0.0f;
         for (size_t i = 0; i < D; ++i) {
-            float kf = k_float_[i];
             out_code.set_value(i, static_cast<uint8_t>(levels[i]));
-            float coeff = (2.0f * levels[i] - kf) / kf;
+            float coeff = (2.0f * levels[i] - K) / K;
             code_ip += coeff * rotated_buf[i];
             if (rotated_parent) code_parent_ip += coeff * rotated_parent[i];
         }

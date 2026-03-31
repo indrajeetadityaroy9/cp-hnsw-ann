@@ -22,8 +22,6 @@ struct TwoLevelVisitationTable {
 
     TwoLevelVisitationTable(const TwoLevelVisitationTable&) = delete;
     TwoLevelVisitationTable& operator=(const TwoLevelVisitationTable&) = delete;
-    TwoLevelVisitationTable(TwoLevelVisitationTable&&) = delete;
-    TwoLevelVisitationTable& operator=(TwoLevelVisitationTable&&) = delete;
 
     uint64_t new_query() const {
         return ++current_epoch_;
@@ -92,7 +90,7 @@ struct BoundedMaxHeap {
     }
 
     float worst_distance() const {
-        return data_.empty() ? std::numeric_limits<float>::max() : data_.front().distance;
+        return data_.front().distance;
     }
 
     std::vector<T> data_;
@@ -124,9 +122,6 @@ std::vector<SearchResult> search(
                        std::greater<BeamEntry>> beam;
     BoundedMaxHeap<SearchResult> nn(k);
 
-    float max_overest = 0.0f;
-    float gamma_q = gamma;
-
     float query_norm_sq = dot_product_simd<D>(raw_query, raw_query);
 
     auto exact_l2 = [&](NodeId id) -> float {
@@ -153,7 +148,7 @@ std::vector<SearchResult> search(
         if (!found) break;
 
 
-        if (nn.size() >= k && current.est_distance > gamma_q * nn.worst_distance()) [[unlikely]] break;
+        if (nn.size() >= k && current.est_distance > gamma * nn.worst_distance()) [[unlikely]] break;
 
         if (nn.size() >= k && current.lower_bound > nn.worst_distance()) continue;
 
@@ -167,12 +162,6 @@ std::vector<SearchResult> search(
 
         float exact_dist = exact_l2(current.id);
         nn.push({current.id, exact_dist});
-
-        if (exact_dist != current.est_distance) {
-            float overest = current.est_distance / exact_dist;
-            max_overest = std::max(max_overest, overest);
-            gamma_q = std::min(gamma, std::max(max_overest, 1.0f));
-        }
 
         const auto& nb = graph.get_neighbors(current.id);
         size_t n_neighbors = nb.size();
@@ -203,7 +192,7 @@ std::vector<SearchResult> search(
             if (visited.check_and_mark_estimated(neighbor_id, query_id)) continue;
 
             float dabs_threshold = (nn.size() >= k)
-                ? gamma_q * nn.worst_distance()
+                ? gamma * nn.worst_distance()
                 : std::numeric_limits<float>::max();
 
             if (warmup) {

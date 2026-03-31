@@ -64,12 +64,7 @@ struct NbitFastScanNeighborBlock {
     uint32_t count;
 
     NbitFastScanNeighborBlock() : count(0) {
-        std::memset(centered_norm, 0, sizeof(centered_norm));
-        std::memset(code_ip, 0, sizeof(code_ip));
-        std::memset(code_parent_ip, 0, sizeof(code_parent_ip));
         std::memset(neighbor_ids, 0xFF, sizeof(neighbor_ids));
-        std::memset(popcounts, 0, sizeof(popcounts));
-        std::memset(weighted_popcounts, 0, sizeof(weighted_popcounts));
     }
 
     void set_neighbor(size_t slot, uint32_t id, const NbitCodeStorage<D>& code, const VertexAuxData& aux_data) {
