@@ -16,14 +16,7 @@
 namespace evtq {
 
 template <typename DistanceFn, typename ErrorFn>
-std::vector<SearchResult> select_neighbors_alpha_cng(
-    const std::vector<SearchResult>& candidates,
-    size_t R,
-    DistanceFn distance_fn,
-    ErrorFn error_fn,
-    float alpha,
-    float tau)
-{
+std::vector<SearchResult> select_neighbors_alpha_cng(const std::vector<SearchResult>& candidates, size_t R, DistanceFn distance_fn, ErrorFn error_fn, float alpha, float tau) {
     if (candidates.size() <= R) {
         return {candidates.begin(), candidates.end()};
     }
@@ -178,13 +171,7 @@ struct SnapshotEntry {
     uint8_t count;
 };
 
-inline void build_join_snapshot(
-    const std::vector<std::vector<SearchResult>>& working,
-    std::vector<std::vector<uint8_t>>& new_flags,
-    std::vector<SnapshotEntry>& snapshot,
-    std::vector<uint32_t>& reverse_offset,
-    std::vector<NodeId>& reverse_data)
-{
+inline void build_join_snapshot(const std::vector<std::vector<SearchResult>>& working, std::vector<std::vector<uint8_t>>& new_flags, std::vector<SnapshotEntry>& snapshot, std::vector<uint32_t>& reverse_offset, std::vector<NodeId>& reverse_data) {
     size_t n = working.size();
 
     std::fill_n(reverse_offset.data() + 1, n, uint32_t{0});
@@ -219,15 +206,7 @@ inline void build_join_snapshot(
 }
 
 template <size_t D>
-size_t nndescent_join_pass(
-    const RaBitQGraph<D>& graph,
-    std::vector<std::vector<SearchResult>>& working,
-    std::vector<std::vector<uint8_t>>& new_flags,
-    size_t actual_threads,
-    std::vector<SnapshotEntry>& snapshot,
-    std::vector<uint32_t>& reverse_offset,
-    std::vector<NodeId>& reverse_data)
-{
+size_t nndescent_join_pass(const RaBitQGraph<D>& graph, std::vector<std::vector<SearchResult>>& working, std::vector<std::vector<uint8_t>>& new_flags, size_t actual_threads, std::vector<SnapshotEntry>& snapshot, std::vector<uint32_t>& reverse_offset, std::vector<NodeId>& reverse_data) {
     size_t n = graph.size();
     build_join_snapshot(working, new_flags, snapshot, reverse_offset, reverse_data);
 

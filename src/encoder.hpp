@@ -120,8 +120,7 @@ struct RandomHadamardRotation {
 
     void apply_copy(const float* input, float* output) const {
         std::memcpy(output, input, original_dim_ * sizeof(float));
-        std::memset(output + original_dim_, 0,
-                    (padded_dim_ - original_dim_) * sizeof(float));
+        std::memset(output + original_dim_, 0, (padded_dim_ - original_dim_) * sizeof(float));
 
         apply(output);
     }
@@ -163,8 +162,7 @@ struct NbitRaBitQEncoder {
         float d_float = static_cast<float>(D);
         norm_factor_ = 1.0f / (d_float * std::sqrt(d_float));
         inv_sqrt_d_ = 1.0f / std::sqrt(d_float);
-        dot_slack_ = std::sqrt((static_cast<float>(M_PI) / 2.0f - 1.0f)
-                               / static_cast<float>(K_INT * K_INT * D));
+        dot_slack_ = std::sqrt((static_cast<float>(M_PI) / 2.0f - 1.0f) / static_cast<float>(K_INT * K_INT * D));
     }
 
     void encode_batch(const float* vecs, size_t num_vecs, CodeType* codes) {
@@ -177,8 +175,7 @@ struct NbitRaBitQEncoder {
 
             #pragma omp for schedule(static)
             for (size_t i = 0; i < num_vecs; ++i) {
-                codes[i] = encode_impl(
-                    vecs + i * dim_, buf.data(), centered.data());
+                codes[i] = encode_impl(vecs + i * dim_, buf.data(), centered.data());
             }
         }
     }
@@ -216,15 +213,13 @@ struct NbitRaBitQEncoder {
         result_code.clear();
 
         alignas(SIMD_ALIGNMENT) float diff[D];
-        result_aux.centered_norm =
-            subtract_and_normalize(neighbor_vec, parent_vec, diff);
+        result_aux.centered_norm = subtract_and_normalize(neighbor_vec, parent_vec, diff);
 
         alignas(SIMD_ALIGNMENT) float rotated[D];
         rotate_and_normalize(diff, rotated);
 
         float code_parent_ip = 0.0f;
-        result_aux.code_ip = caq_quantize(rotated, result_code,
-                                         rotated_parent, &code_parent_ip);
+        result_aux.code_ip = caq_quantize(rotated, result_code, rotated_parent, &code_parent_ip);
         result_aux.code_parent_ip = code_parent_ip;
         return {std::move(result_code), result_aux};
     }

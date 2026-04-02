@@ -96,8 +96,7 @@ struct RaBitQGraph {
     }
 
     float query_distance(const float* query, float query_norm_sq, NodeId id) const {
-        return query_norm_sq + norm_sq_[id]
-               - 2.0f * dot_product_simd<D>(query, raw_vectors_[id].data());
+        return query_norm_sq + norm_sq_[id] - 2.0f * dot_product_simd<D>(query, raw_vectors_[id].data());
     }
 
     void prefetch_norm(NodeId id) const {

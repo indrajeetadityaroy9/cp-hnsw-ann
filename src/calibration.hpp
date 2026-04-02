@@ -7,8 +7,6 @@
 #include "search.hpp"
 
 #include <algorithm>
-#include <cmath>
-#include <limits>
 #include <numeric>
 #include <random>
 #include <vector>
@@ -47,13 +45,7 @@ inline QRCTCalibration fit_gpd(const std::vector<float>& sorted_ratios) {
 }
 
 template <size_t D>
-QRCTCalibration calibrate(
-    const RaBitQGraph<D>& graph,
-    const NbitRaBitQEncoder<D>& encoder,
-    size_t k,
-    float target_recall,
-    size_t num_probes)
-{
+QRCTCalibration calibrate(const RaBitQGraph<D>& graph, const NbitRaBitQEncoder<D>& encoder, size_t k, float target_recall, size_t num_probes) {
     size_t n = graph.size();
 
     std::mt19937 rng(static_cast<uint32_t>(n));
@@ -134,10 +126,7 @@ QRCTCalibration calibrate(
 
         #pragma omp for schedule(guided)
         for (size_t si = 0; si < num_probes; ++si) {
-            auto full = rabitq_search::search<D>(
-                encoded_queries[si], padded_queries[si].data(), graph, k, visited,
-                graph.entry_point(), cal_open);
-
+            auto full = rabitq_search::search<D>(encoded_queries[si], padded_queries[si].data(), graph, k, visited, graph.entry_point(), cal_open);
             ground_truth[si].reserve(full.size());
             for (const auto& sr : full) ground_truth[si].push_back(sr.id);
         }
@@ -162,9 +151,7 @@ QRCTCalibration calibrate(
 
             #pragma omp for schedule(guided)
             for (size_t si = 0; si < num_probes; ++si) {
-                auto term = rabitq_search::search<D>(
-                    encoded_queries[si], padded_queries[si].data(), graph, k, visited,
-                    graph.entry_point(), cal_test);
+                auto term = rabitq_search::search<D>(encoded_queries[si], padded_queries[si].data(), graph, k, visited, graph.entry_point(), cal_test);
 
                 size_t hits = 0;
                 for (const auto& sr : term) {
@@ -172,8 +159,7 @@ QRCTCalibration calibrate(
                         if (sr.id == fid) { ++hits; break; }
                     }
                 }
-                total_recall += static_cast<float>(hits) /
-                    static_cast<float>(ground_truth[si].size());
+                total_recall += static_cast<float>(hits) / static_cast<float>(ground_truth[si].size());
             }
         }
 

@@ -3,10 +3,10 @@
 #include "core.hpp"
 #include "estimator.hpp"
 #include "graph.hpp"
-#include <memory>
-#include <vector>
-#include <queue>
 #include <algorithm>
+#include <memory>
+#include <queue>
+#include <vector>
 
 namespace evtq {
 
@@ -97,19 +97,10 @@ struct BeamEntry {
 };
 
 template <size_t D>
-std::vector<SearchResult> search(
-    RaBitQQuery<D> query,
-    const float* raw_query,
-    const RaBitQGraph<D>& graph,
-    size_t k,
-    TwoLevelVisitationTable& visited,
-    NodeId entry,
-    const QRCTCalibration& cal)
-{
+std::vector<SearchResult> search(RaBitQQuery<D> query, const float* raw_query, const RaBitQGraph<D>& graph, size_t k, TwoLevelVisitationTable& visited, NodeId entry, const QRCTCalibration& cal) {
     uint64_t query_id = visited.new_query();
 
-    std::priority_queue<BeamEntry, std::vector<BeamEntry>,
-                       std::greater<BeamEntry>> beam;
+    std::priority_queue<BeamEntry, std::vector<BeamEntry>, std::greater<BeamEntry>> beam;
     BoundedMaxHeap<SearchResult> nn(k);
 
     float query_norm_sq = dot_product_simd<D>(raw_query, raw_query);
@@ -136,7 +127,6 @@ std::vector<SearchResult> search(
             break;
         }
         if (!found) break;
-
 
         if (nn.size() >= k && current.lower_bound > nn.worst_distance()) continue;
 
@@ -175,8 +165,7 @@ std::vector<SearchResult> search(
         size_t n_neighbors = nb.size();
         float dist_qp_sq = exact_dist;
         bool warmup = (nn.size() < k);
-        estimator::estimate_neighbors_for_search<D>(
-            query, nb, dist_qp_sq, nn.worst_distance(), !warmup, estimates);
+        estimator::estimate_neighbors_for_search<D>(query, nb, dist_qp_sq, nn.worst_distance(), !warmup, estimates);
 
         constexpr size_t VISIT_PREFETCH = CACHE_LINE_SIZE / sizeof(uint64_t);
         size_t prefetch_count = std::min(n_neighbors, VISIT_PREFETCH);
@@ -186,8 +175,7 @@ std::vector<SearchResult> search(
             graph.prefetch_norm(nid);
         }
 
-        constexpr size_t PREFETCH_LOOKAHEAD =
-            (RaBitQGraph<D>::PREFETCH_LINES + VISIT_PREFETCH - 1) / VISIT_PREFETCH;
+        constexpr size_t PREFETCH_LOOKAHEAD = (RaBitQGraph<D>::PREFETCH_LINES + VISIT_PREFETCH - 1) / VISIT_PREFETCH;
         for (size_t i = 0; i < n_neighbors; ++i) {
             if (i + PREFETCH_LOOKAHEAD < n_neighbors) {
                 NodeId future_id = nb.neighbor_ids[i + PREFETCH_LOOKAHEAD];
