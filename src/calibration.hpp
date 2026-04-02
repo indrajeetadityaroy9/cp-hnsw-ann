@@ -37,7 +37,7 @@ inline QRCTCalibration fit_gpd(const std::vector<float>& sorted_ratios) {
     b1 /= static_cast<double>(n_exc);
 
     double d = b0 - 2.0 * b1;
-    float xi = std::max(-1.0f, static_cast<float>(2.0 - b0 / d));
+    float xi = (d > 0.0) ? std::max(-1.0f, static_cast<float>(2.0 - b0 / d)) : -1.0f;
     float sigma = static_cast<float>(b0) * (1.0f - xi);
 
     float p_u = static_cast<float>(n_exc) / static_cast<float>(m);

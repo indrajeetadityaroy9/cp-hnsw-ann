@@ -241,6 +241,15 @@ struct alignas(SIMD_ALIGNMENT) NbitCodeStorage {
         }
         return total;
     }
+
+    uint32_t msb2_popcount() const {
+        uint32_t pc0 = 0, pc1 = 0;
+        for (size_t i = 0; i < NUM_WORDS; ++i) {
+            pc0 += static_cast<uint32_t>(__builtin_popcountll(planes[0][i]));
+            pc1 += static_cast<uint32_t>(__builtin_popcountll(planes[1][i]));
+        }
+        return 2 * pc0 + pc1;
+    }
 };
 
 template <size_t D>
@@ -270,7 +279,9 @@ namespace qrct {
 
 inline float gpd_survival(float t, const QRCTCalibration& cal) {
     if (t <= cal.u) return cal.p_u;
-    float z = 1.0f + cal.xi * (t - cal.u) / cal.sigma;
+    float excess = (t - cal.u) / cal.sigma;
+    if (cal.xi == 0.0f) return cal.p_u * std::exp(-excess);
+    float z = 1.0f + cal.xi * excess;
     if (z <= 0.0f) return 0.0f;
     return cal.p_u * std::pow(z, -1.0f / cal.xi);
 }

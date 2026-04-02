@@ -43,11 +43,8 @@ inline void estimate_neighbors_for_search(const RaBitQQuery<D>& query, const Nbi
         if (batch_start >= n_neighbors) break;
         size_t batch_count = std::min(BATCH, n_neighbors - batch_start);
 
-        if (batch + 1 < num_batches && (batch + 1) * BATCH < n_neighbors)
-            prefetch_t<0>(reinterpret_cast<const char*>(&neighbors.code_blocks[batch + 1]));
-
         fastscan::compute_msb_only_inner_products<D>(query.lut, neighbors.code_blocks[batch], out.msb_sums + batch_start);
-        fastscan::convert_msb_to_lower_bounds<D>(query, out.msb_sums + batch_start, neighbors.centered_norm + batch_start, neighbors.code_ip + batch_start, neighbors.code_parent_ip + batch_start, neighbors.popcounts + batch_start, batch_count, out.lower_bounds + batch_start, dist_qp_sq);
+        fastscan::convert_msb_to_lower_bounds<D>(query, out.msb_sums + batch_start, neighbors.centered_norm + batch_start, neighbors.code_ip + batch_start, neighbors.code_parent_ip + batch_start, neighbors.msb2_popcounts + batch_start, batch_count, out.lower_bounds + batch_start, dist_qp_sq);
 
         bool any_survivor = !prune_full_estimates;
         if (prune_full_estimates) {

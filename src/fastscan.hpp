@@ -58,6 +58,7 @@ struct NbitFastScanNeighborBlock {
     alignas(SIMD_ALIGNMENT) float code_ip[GRAPH_DEGREE];
     alignas(SIMD_ALIGNMENT) float code_parent_ip[GRAPH_DEGREE];
     alignas(SIMD_ALIGNMENT) uint16_t popcounts[GRAPH_DEGREE];
+    alignas(SIMD_ALIGNMENT) uint16_t msb2_popcounts[GRAPH_DEGREE];
     alignas(SIMD_ALIGNMENT) uint16_t weighted_popcounts[GRAPH_DEGREE];
     alignas(SIMD_ALIGNMENT) uint32_t neighbor_ids[GRAPH_DEGREE];
     uint32_t count;
@@ -73,6 +74,7 @@ struct NbitFastScanNeighborBlock {
         code_ip[slot] = aux_data.code_ip;
         code_parent_ip[slot] = aux_data.code_parent_ip;
         popcounts[slot] = static_cast<uint16_t>(code.msb_popcount());
+        msb2_popcounts[slot] = static_cast<uint16_t>(code.msb2_popcount());
         weighted_popcounts[slot] = static_cast<uint16_t>(code.weighted_popcount());
         if (slot >= count) count = static_cast<uint32_t>(slot + 1);
     }

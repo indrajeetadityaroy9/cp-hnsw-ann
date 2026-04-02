@@ -91,6 +91,7 @@ void prune_and_write(RaBitQGraph<D>& graph, const EncType& encoder, NodeId node,
         float lo = alpha, hi = alpha_max;
         while (selected.size() < GRAPH_DEGREE && lo < hi) {
             float mid = (lo + hi) * 0.5f;
+            if (mid == lo || mid == hi) break;
             auto trial = select_neighbors_alpha_cng(
                 candidates, GRAPH_DEGREE, dist_fn, error_fn, mid, tau);
             if (trial.size() >= GRAPH_DEGREE) {
