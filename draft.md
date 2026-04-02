@@ -1,7 +1,6 @@
-# Research Grant Technical Proposal
+# Research Technical Proposal
 
 **Project Title:** Queue-Risk-Calibrated Termination (QRCT) for Quantized Graph ANN Search: A Constrained Extreme-Value Framework
-**Principal Investigator:** [Insert Name]
 **Target Domain:** Vector Search, Statistical Learning Theory, Database Systems
 
 ---
