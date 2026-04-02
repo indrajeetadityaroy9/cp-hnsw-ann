@@ -1,5 +1,6 @@
 import os
 import subprocess
+import sys
 from pathlib import Path
 
 import pybind11
@@ -25,6 +26,7 @@ class CMakeBuild(build_ext):
             f"-DCMAKE_LIBRARY_OUTPUT_DIRECTORY={extdir}",
             f"-DCMAKE_BUILD_TYPE={cfg}",
             f"-Dpybind11_DIR={pybind11.get_cmake_dir()}",
+            f"-DPython_EXECUTABLE={sys.executable}",
         ]
 
         build_temp = Path(self.build_temp) / ext.name

@@ -518,7 +518,10 @@ void optimize_graph_adaptive(RaBitQGraph<D>& graph, const EncType& encoder) {
     }
 
     size_t alpha_sample = static_cast<size_t>(std::sqrt(static_cast<double>(n)));
-    auto [alpha, tau, alpha_max] = derive_graph_stats<D>(graph, working, alpha_sample);
+    auto graph_stats = derive_graph_stats<D>(graph, working, alpha_sample);
+    float alpha = std::get<0>(graph_stats);
+    float tau = std::get<1>(graph_stats);
+    float alpha_max = std::get<2>(graph_stats);
 
     #pragma omp parallel for schedule(guided) num_threads(actual_threads)
     for (size_t i = 0; i < n; ++i) {

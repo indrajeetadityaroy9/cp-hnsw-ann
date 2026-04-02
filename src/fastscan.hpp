@@ -6,7 +6,12 @@
 #include <cmath>
 #include <algorithm>
 
+#ifdef __x86_64__
 #include <immintrin.h>
+#else
+#include <simde/x86/avx2.h>
+#include <simde/x86/fma.h>
+#endif
 
 namespace evtq {
 
