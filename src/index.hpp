@@ -61,7 +61,9 @@ struct Index : IndexBase {
     void finalize(size_t k, float target_recall) override {
         std::unique_lock<std::shared_mutex> lock(index_mutex_);
         graph_refinement::optimize_graph_adaptive(graph_, encoder_);
-        calibration_ = qrct::calibrate<D>(graph_, encoder_, k, target_recall);
+        size_t num_probes = static_cast<size_t>(
+            std::ceil(std::sqrt(static_cast<double>(graph_.size()))));
+        calibration_ = qrct::calibrate<D>(graph_, encoder_, k, target_recall, num_probes);
     }
 
     std::vector<SearchResult> search(
