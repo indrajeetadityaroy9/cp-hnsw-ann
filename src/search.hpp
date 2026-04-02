@@ -7,18 +7,14 @@
 #include <vector>
 #include <queue>
 #include <algorithm>
-#include <limits>
 
 namespace evtq {
 
 struct TwoLevelVisitationTable {
     explicit TwoLevelVisitationTable(size_t capacity)
-        : capacity_(capacity), current_epoch_(0) {
-        estimated_ = std::make_unique<uint64_t[]>(capacity);
-        visited_ = std::make_unique<uint64_t[]>(capacity);
-        std::fill_n(estimated_.get(), capacity, uint64_t{0});
-        std::fill_n(visited_.get(), capacity, uint64_t{0});
-    }
+        : capacity_(capacity), current_epoch_(0)
+        , estimated_(std::make_unique<uint64_t[]>(capacity))
+        , visited_(std::make_unique<uint64_t[]>(capacity)) {}
 
     TwoLevelVisitationTable(const TwoLevelVisitationTable&) = delete;
     TwoLevelVisitationTable& operator=(const TwoLevelVisitationTable&) = delete;
@@ -46,14 +42,8 @@ struct TwoLevelVisitationTable {
     }
 
     void resize(size_t new_capacity) {
-        auto new_est = std::make_unique<uint64_t[]>(new_capacity);
-        auto new_vis = std::make_unique<uint64_t[]>(new_capacity);
-        std::memcpy(new_est.get(), estimated_.get(), capacity_ * sizeof(uint64_t));
-        std::memcpy(new_vis.get(), visited_.get(), capacity_ * sizeof(uint64_t));
-        std::fill_n(new_est.get() + capacity_, new_capacity - capacity_, uint64_t{0});
-        std::fill_n(new_vis.get() + capacity_, new_capacity - capacity_, uint64_t{0});
-        estimated_ = std::move(new_est);
-        visited_ = std::move(new_vis);
+        estimated_ = std::make_unique<uint64_t[]>(new_capacity);
+        visited_ = std::make_unique<uint64_t[]>(new_capacity);
         capacity_ = new_capacity;
     }
 
@@ -112,9 +102,9 @@ std::vector<SearchResult> search(
     const float* raw_query,
     const RaBitQGraph<D>& graph,
     size_t k,
-    float gamma,
     TwoLevelVisitationTable& visited,
-    NodeId entry)
+    NodeId entry,
+    const QRCTCalibration& cal)
 {
     uint64_t query_id = visited.new_query();
 
@@ -148,8 +138,6 @@ std::vector<SearchResult> search(
         if (!found) break;
 
 
-        if (nn.size() >= k && current.est_distance > gamma * nn.worst_distance()) [[unlikely]] break;
-
         if (nn.size() >= k && current.lower_bound > nn.worst_distance()) continue;
 
         if (!beam.empty()) {
@@ -162,6 +150,26 @@ std::vector<SearchResult> search(
 
         float exact_dist = exact_l2(current.id);
         nn.push({current.id, exact_dist});
+
+        if (nn.size() >= k) {
+            float R_B = 0.0f;
+            float d_k_sq = nn.worst_distance();
+            thread_local std::vector<BeamEntry> risk_buf;
+            risk_buf.clear();
+
+            while (!beam.empty()) {
+                BeamEntry e = beam.top();
+                beam.pop();
+                if (visited.is_visited(e.id, query_id)) continue;
+                float surv = qrct::gpd_survival(e.est_distance / d_k_sq, cal);
+                if (surv == 0.0f) break;
+                risk_buf.push_back(e);
+                R_B += surv;
+            }
+            for (const auto& e : risk_buf) beam.push(e);
+
+            if (R_B <= cal.delta) return nn.extract_sorted();
+        }
 
         const auto& nb = graph.get_neighbors(current.id);
         size_t n_neighbors = nb.size();
@@ -191,16 +199,10 @@ std::vector<SearchResult> search(
             NodeId neighbor_id = nb.neighbor_ids[i];
             if (visited.check_and_mark_estimated(neighbor_id, query_id)) continue;
 
-            float dabs_threshold = (nn.size() >= k)
-                ? gamma * nn.worst_distance()
-                : std::numeric_limits<float>::max();
-
             if (warmup) {
                 float exact = exact_l2(neighbor_id);
                 nn.push({neighbor_id, exact});
-                if (exact < dabs_threshold) {
-                    beam.push({exact, exact, neighbor_id});
-                }
+                beam.push({exact, exact, neighbor_id});
                 graph.prefetch_vertex(neighbor_id);
                 continue;
             }
@@ -212,11 +214,8 @@ std::vector<SearchResult> search(
             if (est_dist < nn.worst_distance()) {
                 float exact = exact_l2(neighbor_id);
                 nn.push({neighbor_id, exact});
-                if (exact < dabs_threshold) {
-                    beam.push({exact, lower, neighbor_id});
-                }
-
-            } else if (est_dist < dabs_threshold) {
+                beam.push({exact, lower, neighbor_id});
+            } else {
                 beam.push({est_dist, lower, neighbor_id});
             }
             graph.prefetch_vertex(neighbor_id);

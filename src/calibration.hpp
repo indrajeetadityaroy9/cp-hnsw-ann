@@ -1,27 +1,59 @@
 #pragma once
 
 #include "core.hpp"
+#include "encoder.hpp"
 #include "estimator.hpp"
 #include "graph.hpp"
+#include "search.hpp"
+
 #include <algorithm>
 #include <cmath>
+#include <limits>
 #include <numeric>
 #include <random>
 #include <vector>
 
 #include <omp.h>
 
-namespace evtq {
+namespace evtq::qrct {
 
-struct CalibrationSnapshot {
-    float gamma;
-    float dot_slack;
-};
+inline QRCTCalibration fit_gpd(const std::vector<float>& sorted_ratios) {
+    size_t m = sorted_ratios.size();
+    size_t half = m / 2;
+    float u = sorted_ratios[half];
+    size_t n_exc = m - half;
 
-namespace calibration {
+    double b0 = 0.0, b1 = 0.0;
+    double nm1 = static_cast<double>(n_exc - 1);
+    for (size_t i = 0; i < n_exc; ++i) {
+        double x = static_cast<double>(sorted_ratios[half + i] - u);
+        b0 += x;
+        b1 += x * static_cast<double>(i) / nm1;
+    }
+    b0 /= static_cast<double>(n_exc);
+    b1 /= static_cast<double>(n_exc);
 
-template <size_t D, typename EncType>
-std::vector<float> collect_ratios(const RaBitQGraph<D>& graph, const EncType& encoder, size_t num_probes) {
+    double d = b0 - 2.0 * b1;
+    float xi = std::max(-1.0f, static_cast<float>(2.0 - b0 / d));
+    constexpr float eps_xi = 1e-4f;
+    xi = std::min(xi, -eps_xi);
+    float sigma = static_cast<float>(b0) * (1.0f - xi);
+
+    float max_exc = sorted_ratios.back() - u;
+    if (-sigma / xi < max_exc) {
+        sigma = -xi * max_exc;
+    }
+
+    float p_u = static_cast<float>(n_exc) / static_cast<float>(m);
+    return {xi, sigma, u, p_u, 0.0f};
+}
+
+template <size_t D>
+std::vector<float> collect_ratios(
+    const RaBitQGraph<D>& graph,
+    const NbitRaBitQEncoder<D>& encoder,
+    size_t num_probes)
+{
     size_t n = graph.size();
 
     std::mt19937 rng(static_cast<uint32_t>(n ^ num_probes));
@@ -78,43 +110,119 @@ std::vector<float> collect_ratios(const RaBitQGraph<D>& graph, const EncType& en
     return all;
 }
 
-template <size_t D, typename EncType>
-CalibrationSnapshot calibrate(const RaBitQGraph<D>& graph, const EncType& encoder, float dot_slack) {
+template <size_t D>
+float calibrate_delta(
+    const RaBitQGraph<D>& graph,
+    const NbitRaBitQEncoder<D>& encoder,
+    const QRCTCalibration& fit,
+    size_t k,
+    float target_recall,
+    size_t num_probes)
+{
     size_t n = graph.size();
 
-    auto ratios = collect_ratios<D>(
-        graph, encoder,
-        static_cast<size_t>(std::ceil(std::sqrt(static_cast<double>(n)))));
+    std::mt19937 rng(static_cast<uint32_t>(n ^ k));
+    std::vector<size_t> indices(n);
+    std::iota(indices.begin(), indices.end(), 0);
+    std::shuffle(indices.begin(), indices.end(), rng);
+    indices.resize(num_probes);
 
+    std::vector<AlignedVector<float>> padded_queries(num_probes);
+    std::vector<RaBitQQuery<D>> encoded_queries(num_probes);
+    for (size_t si = 0; si < num_probes; ++si) {
+        padded_queries[si].resize(D);
+        const float* qvec = graph.get_vector(static_cast<NodeId>(indices[si]));
+        std::copy_n(qvec, graph.dim_, padded_queries[si].data());
+        if (graph.dim_ < D) {
+            std::fill_n(padded_queries[si].data() + graph.dim_, D - graph.dim_, 0.0f);
+        }
+        encoded_queries[si] = encoder.encode_query_raw(padded_queries[si].data());
+    }
+
+    QRCTCalibration cal_open = fit;
+    cal_open.delta = std::numeric_limits<float>::max();
+
+    std::vector<std::vector<NodeId>> ground_truth(num_probes);
+
+    #pragma omp parallel
+    {
+        thread_local TwoLevelVisitationTable visited(0);
+        if (visited.capacity() < n) visited.resize(n);
+
+        #pragma omp for schedule(guided)
+        for (size_t si = 0; si < num_probes; ++si) {
+            auto full = rabitq_search::search<D>(
+                encoded_queries[si], padded_queries[si].data(), graph, k, visited,
+                graph.entry_point(), cal_open);
+
+            ground_truth[si].reserve(full.size());
+            for (const auto& sr : full) ground_truth[si].push_back(sr.id);
+        }
+    }
+
+    float lo = 0.0f;
+    float hi = static_cast<float>(k);
+
+    size_t num_iterations = static_cast<size_t>(std::ceil(
+        std::log2(hi / std::numeric_limits<float>::epsilon())));
+
+    for (size_t iter = 0; iter < num_iterations; ++iter) {
+        float mid = (lo + hi) * 0.5f;
+        QRCTCalibration cal_test = fit;
+        cal_test.delta = mid;
+
+        float total_recall = 0.0f;
+
+        #pragma omp parallel reduction(+:total_recall)
+        {
+            thread_local TwoLevelVisitationTable visited(0);
+            if (visited.capacity() < n) visited.resize(n);
+
+            #pragma omp for schedule(guided)
+            for (size_t si = 0; si < num_probes; ++si) {
+                auto term = rabitq_search::search<D>(
+                    encoded_queries[si], padded_queries[si].data(), graph, k, visited,
+                    graph.entry_point(), cal_test);
+
+                size_t hits = 0;
+                for (const auto& sr : term) {
+                    for (NodeId fid : ground_truth[si]) {
+                        if (sr.id == fid) { ++hits; break; }
+                    }
+                }
+                total_recall += static_cast<float>(hits) /
+                    static_cast<float>(ground_truth[si].size());
+            }
+        }
+
+        float mean_recall = total_recall / static_cast<float>(num_probes);
+        if (mean_recall >= target_recall) {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+
+    return lo;
+}
+
+template <size_t D>
+QRCTCalibration calibrate(
+    const RaBitQGraph<D>& graph,
+    const NbitRaBitQEncoder<D>& encoder,
+    size_t k,
+    float target_recall)
+{
+    size_t n = graph.size();
+    size_t num_probes = static_cast<size_t>(
+        std::ceil(std::sqrt(static_cast<double>(n))));
+
+    auto ratios = collect_ratios<D>(graph, encoder, num_probes);
     std::sort(ratios.begin(), ratios.end());
-    size_t m = ratios.size();
-    size_t half = m / 2;
-    float threshold = ratios[half];
-
-    size_t n_exc = m - half;
-    double b0 = 0.0, b1 = 0.0;
-    double nm1 = static_cast<double>(n_exc - 1);
-    for (size_t i = 0; i < n_exc; ++i) {
-        double x = static_cast<double>(ratios[half + i] - threshold);
-        b0 += x;
-        b1 += x * static_cast<double>(i) / nm1;
-    }
-    b0 /= static_cast<double>(n_exc);
-    b1 /= static_cast<double>(n_exc);
-    double d = b0 - 2.0 * b1;
-    float xi = static_cast<float>(2.0 - b0 / d);
-    float sigma = static_cast<float>(2.0 * b0 * b1 / d);
-
-    float gamma;
-    if (xi == 0.0f) {
-        gamma = threshold + sigma * std::log(static_cast<float>(m) / 2.0f);
-    } else {
-        gamma = threshold
-            + sigma / xi * (std::pow(static_cast<float>(m) / 2.0f, xi) - 1.0f);
-    }
-
-    return {gamma, dot_slack};
+    auto cal = fit_gpd(ratios);
+    cal.delta = calibrate_delta<D>(graph, encoder, cal, k,
+                                   target_recall, num_probes);
+    return cal;
 }
 
-}
 }

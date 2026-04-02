@@ -52,7 +52,7 @@ struct NbitFastScanCodeBlock {
 
 template <size_t D>
 struct NbitFastScanNeighborBlock {
-    static constexpr size_t NUM_BATCHES = GRAPH_DEGREE / 32;
+    static constexpr size_t NUM_BATCHES = GRAPH_DEGREE / (256 / CHAR_BIT);
 
     NbitFastScanCodeBlock<D> code_blocks[NUM_BATCHES];
     alignas(SIMD_ALIGNMENT) float centered_norm[GRAPH_DEGREE];
@@ -102,7 +102,7 @@ inline void compute_inner_products(const uint8_t lut[][16], const FastScanCodeBl
     constexpr size_t NUM_SUB_PAIRS = FastScanCodeBlock<D>::NUM_SUB_PAIRS;
     constexpr size_t NUM_SUB_SEGMENTS = FastScanCodeBlock<D>::NUM_SUB_SEGMENTS;
     constexpr size_t FLUSH = std::numeric_limits<uint8_t>::max()
-        / (2 * (CHAR_BIT / 2) * ((1 << (CHAR_BIT / 2)) - 1));
+        / (2 * BIT_WIDTH * ((1 << BIT_WIDTH) - 1));
 
     const __m256i low_mask = _mm256_set1_epi8(0x0F);
     __m256i acc_lo = _mm256_setzero_si256();
@@ -303,7 +303,7 @@ inline void compute_msb_only_inner_products(const uint8_t lut[][16], const NbitF
 
 template <size_t D>
 inline void convert_msb_to_lower_bounds(const RaBitQQuery<D>& query, const uint32_t* msb_fastscan_sums, const float* centered_norm_arr, const float* code_ip_arr, const float* code_parent_ip_arr, const uint16_t* msb_popcounts, size_t count, float* __restrict__ out_lower, float dist_qp_sq) {
-    constexpr float INV_K_PARTIAL = 1.0f / static_cast<float>((1 << std::min(BIT_WIDTH, size_t(2))) - 1);
+    constexpr float INV_K_PARTIAL = 1.0f / static_cast<float>((1 << (BIT_WIDTH / 2)) - 1);
 
     const float A = query.coeff_fastscan * INV_K_PARTIAL;
     const float B = query.coeff_popcount * INV_K_PARTIAL;

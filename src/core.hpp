@@ -1,6 +1,7 @@
 #pragma once
 
 #include <bit>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -256,5 +257,24 @@ struct NbitRaBitQCode {
         code_ip = 0.0f;
     }
 };
+
+struct QRCTCalibration {
+    float xi;
+    float sigma;
+    float u;
+    float p_u;
+    float delta;
+};
+
+namespace qrct {
+
+inline float gpd_survival(float t, const QRCTCalibration& cal) {
+    if (t <= cal.u) return cal.p_u;
+    float z = 1.0f + cal.xi * (t - cal.u) / cal.sigma;
+    if (z <= 0.0f) return 0.0f;
+    return cal.p_u * std::pow(z, -1.0f / cal.xi);
+}
+
+}
 
 }

@@ -14,3 +14,4 @@ data:
 eval:
   k: 100
   n_runs: 3
+  target_recall: 0.95

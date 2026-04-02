@@ -9,6 +9,7 @@
 #include <cstdint>
 #include <random>
 #include <atomic>
+#include <tuple>
 
 #include <omp.h>
 
@@ -16,25 +17,16 @@ namespace evtq {
 
 template <typename DistanceFn, typename ErrorFn>
 std::vector<SearchResult> select_neighbors_alpha_cng(
-    std::vector<SearchResult> candidates,
+    const std::vector<SearchResult>& candidates,
     size_t R,
     DistanceFn distance_fn,
     ErrorFn error_fn,
     float alpha,
     float tau)
 {
-    std::sort(candidates.begin(), candidates.end(),
-              [](const auto& a, const auto& b) {
-                  return a.id < b.id || (a.id == b.id && a.distance < b.distance);
-              });
-    candidates.erase(
-        std::unique(candidates.begin(), candidates.end(),
-                    [](const auto& a, const auto& b) { return a.id == b.id; }),
-        candidates.end());
-
-    std::sort(candidates.begin(), candidates.end());
-
-    if (candidates.size() <= R) return candidates;
+    if (candidates.size() <= R) {
+        return {candidates.begin(), candidates.end()};
+    }
 
     float local_alpha = std::max(alpha, 1.0f);
 
@@ -77,24 +69,27 @@ std::vector<SearchResult> select_neighbors_alpha_cng(
     return selected;
 }
 
-struct GraphStats {
-    float alpha;
-    float tau;
-    float alpha_max;
-};
-
 namespace graph_refinement {
 
 template <size_t D, typename EncType>
-void prune_and_write(RaBitQGraph<D>& graph, const EncType& encoder, NodeId node, std::vector<SearchResult>& candidates, float alpha, float tau, float alpha_max = 0.0f) {
-    const float error_tolerance = 1.0f / std::sqrt(static_cast<float>(D));
+void prune_and_write(RaBitQGraph<D>& graph, const EncType& encoder, NodeId node, std::vector<SearchResult>& candidates, float alpha, float tau, float alpha_max) {
     auto dist_fn = [&](NodeId a, NodeId b) -> float {
         return graph.distance_between(a, b);
     };
     auto error_fn = [&](NodeId nid) -> float {
         const auto& code = graph.get_code(nid);
-        return error_tolerance * code.centered_norm;
+        return encoder.inv_sqrt_d_ * code.centered_norm;
     };
+
+    std::sort(candidates.begin(), candidates.end(),
+              [](const auto& a, const auto& b) {
+                  return a.id < b.id || (a.id == b.id && a.distance < b.distance);
+              });
+    candidates.erase(
+        std::unique(candidates.begin(), candidates.end(),
+                    [](const auto& a, const auto& b) { return a.id == b.id; }),
+        candidates.end());
+    std::sort(candidates.begin(), candidates.end());
 
     auto selected = select_neighbors_alpha_cng(
         candidates, GRAPH_DEGREE, dist_fn, error_fn, alpha, tau);
@@ -118,7 +113,7 @@ void prune_and_write(RaBitQGraph<D>& graph, const EncType& encoder, NodeId node,
     nb.count = 0;
     const float* vec_node = graph.get_vector(node);
 
-    alignas(32) float rotated_parent[D];
+    alignas(SIMD_ALIGNMENT) float rotated_parent[D];
     encoder.rotate_and_normalize(vec_node, rotated_parent);
 
     for (size_t j = 0; j < selected.size(); ++j) {
@@ -136,31 +131,35 @@ template <size_t D>
 void init_working_random(const RaBitQGraph<D>& graph, std::vector<std::vector<SearchResult>>& working, size_t actual_threads) {
     size_t n = graph.size();
 
+    size_t pool_size = std::min(
+        static_cast<size_t>(static_cast<double>(GRAPH_DEGREE) *
+            std::ceil(std::log(static_cast<double>(n) / static_cast<double>(GRAPH_DEGREE)))),
+        n - 1);
+
     #pragma omp parallel num_threads(actual_threads)
     {
         int tid = omp_get_thread_num();
         std::mt19937 rng(static_cast<uint32_t>(n ^ static_cast<uint64_t>(tid)));
 
+        std::vector<uint64_t> seen_epoch(n, 0);
+        uint64_t seen_counter = 0;
+        std::vector<SearchResult> candidates;
+        candidates.reserve(pool_size);
+
         #pragma omp for schedule(static)
         for (size_t i = 0; i < n; ++i) {
             NodeId u = static_cast<NodeId>(i);
             working[i].clear();
+            candidates.clear();
 
             std::uniform_int_distribution<size_t> dist(0, n - 1);
 
-            std::vector<SearchResult> candidates;
-            size_t pool_size = std::min(
-                static_cast<size_t>(static_cast<double>(GRAPH_DEGREE) *
-                    std::ceil(std::log(static_cast<double>(n) / static_cast<double>(GRAPH_DEGREE)))),
-                n - 1);
-            candidates.reserve(pool_size);
-
-            std::vector<bool> seen(n, false);
-            seen[u] = true;
+            uint64_t cur = ++seen_counter;
+            seen_epoch[u] = cur;
             while (candidates.size() < pool_size) {
                 NodeId v = static_cast<NodeId>(dist(rng));
-                if (seen[v]) continue;
-                seen[v] = true;
+                if (seen_epoch[v] == cur) continue;
+                seen_epoch[v] = cur;
                 float d = graph.distance_between(u, v);
                 candidates.push_back({v, d});
             }
@@ -179,8 +178,16 @@ struct SnapshotEntry {
     uint8_t count;
 };
 
-inline void build_join_snapshot(const std::vector<std::vector<SearchResult>>& working, std::vector<std::vector<uint8_t>>& new_flags, std::vector<SnapshotEntry>& snapshot, std::vector<std::vector<NodeId>>& reverse) {
+inline void build_join_snapshot(
+    const std::vector<std::vector<SearchResult>>& working,
+    std::vector<std::vector<uint8_t>>& new_flags,
+    std::vector<SnapshotEntry>& snapshot,
+    std::vector<uint32_t>& reverse_offset,
+    std::vector<NodeId>& reverse_data)
+{
     size_t n = working.size();
+
+    std::fill_n(reverse_offset.data() + 1, n, uint32_t{0});
 
     for (size_t i = 0; i < n; ++i) {
         size_t sz = std::min(working[i].size(), static_cast<size_t>(GRAPH_DEGREE));
@@ -188,27 +195,41 @@ inline void build_join_snapshot(const std::vector<std::vector<SearchResult>>& wo
         for (size_t j = 0; j < sz; ++j) {
             snapshot[i].ids[j] = working[i][j].id;
             snapshot[i].is_new[j] = new_flags[i][j];
+            NodeId v = working[i][j].id;
+            if (v != INVALID_NODE) reverse_offset[v + 1]++;
         }
         std::fill(new_flags[i].begin(), new_flags[i].end(), 0);
     }
 
+    reverse_offset[0] = 0;
+    for (size_t i = 1; i <= n; ++i)
+        reverse_offset[i] += reverse_offset[i - 1];
+
     for (size_t i = 0; i < n; ++i) {
         for (size_t j = 0; j < snapshot[i].count; ++j) {
             NodeId v = snapshot[i].ids[j];
-            if (v != INVALID_NODE) {
-                reverse[v].push_back(static_cast<NodeId>(i));
-            }
+            if (v != INVALID_NODE)
+                reverse_data[reverse_offset[v]++] = static_cast<NodeId>(i);
         }
     }
+
+    for (size_t i = n; i > 0; --i)
+        reverse_offset[i] = reverse_offset[i - 1];
+    reverse_offset[0] = 0;
 }
 
 template <size_t D>
-size_t nndescent_join_pass(const RaBitQGraph<D>& graph, std::vector<std::vector<SearchResult>>& working, std::vector<std::vector<uint8_t>>& new_flags, size_t actual_threads) {
+size_t nndescent_join_pass(
+    const RaBitQGraph<D>& graph,
+    std::vector<std::vector<SearchResult>>& working,
+    std::vector<std::vector<uint8_t>>& new_flags,
+    size_t actual_threads,
+    std::vector<SnapshotEntry>& snapshot,
+    std::vector<uint32_t>& reverse_offset,
+    std::vector<NodeId>& reverse_data)
+{
     size_t n = graph.size();
-
-    std::vector<SnapshotEntry> snapshot(n);
-    std::vector<std::vector<NodeId>> reverse(n);
-    build_join_snapshot(working, new_flags, snapshot, reverse);
+    build_join_snapshot(working, new_flags, snapshot, reverse_offset, reverse_data);
 
     std::atomic<size_t> total_updates{0};
 
@@ -216,6 +237,10 @@ size_t nndescent_join_pass(const RaBitQGraph<D>& graph, std::vector<std::vector<
     {
         std::vector<NodeId> candidates;
         candidates.reserve(GRAPH_DEGREE * GRAPH_DEGREE);
+
+        thread_local std::vector<uint64_t> neighbor_epoch;
+        thread_local uint64_t epoch_counter = 0;
+        if (neighbor_epoch.size() < n) neighbor_epoch.resize(n, 0);
 
         #pragma omp for schedule(guided)
         for (size_t i = 0; i < n; ++i) {
@@ -228,7 +253,8 @@ size_t nndescent_join_pass(const RaBitQGraph<D>& graph, std::vector<std::vector<
             }
 
             bool has_new_reverse = false;
-            for (NodeId rv : reverse[i]) {
+            for (size_t ri = reverse_offset[i]; ri < reverse_offset[i + 1]; ++ri) {
+                NodeId rv = reverse_data[ri];
                 for (size_t j = 0; j < snapshot[rv].count; ++j) {
                     if (snapshot[rv].is_new[j]) { has_new_reverse = true; break; }
                 }
@@ -239,14 +265,13 @@ size_t nndescent_join_pass(const RaBitQGraph<D>& graph, std::vector<std::vector<
 
             candidates.clear();
 
-            thread_local std::vector<bool> in_neighbor_set;
-            in_neighbor_set.assign(n, false);
-            in_neighbor_set[u] = true;
+            uint64_t cur_epoch = ++epoch_counter;
+            neighbor_epoch[u] = cur_epoch;
             for (const auto& nb : neighbors) {
-                if (nb.id != INVALID_NODE) in_neighbor_set[nb.id] = true;
+                if (nb.id != INVALID_NODE) neighbor_epoch[nb.id] = cur_epoch;
             }
             auto is_current_or_self = [&](NodeId w) -> bool {
-                return in_neighbor_set[w];
+                return neighbor_epoch[w] == cur_epoch;
             };
 
             if (has_new_forward) {
@@ -263,7 +288,8 @@ size_t nndescent_join_pass(const RaBitQGraph<D>& graph, std::vector<std::vector<
                 }
             }
 
-            for (NodeId rv : reverse[i]) {
+            for (size_t ri = reverse_offset[i]; ri < reverse_offset[i + 1]; ++ri) {
+                NodeId rv = reverse_data[ri];
                 bool rv_has_new = false;
                 for (size_t j = 0; j < snapshot[rv].count; ++j) {
                     if (snapshot[rv].is_new[j]) { rv_has_new = true; break; }
@@ -321,8 +347,7 @@ size_t nndescent_join_pass(const RaBitQGraph<D>& graph, std::vector<std::vector<
 
 
 template <size_t D>
-GraphStats derive_graph_stats(const RaBitQGraph<D>& graph, const std::vector<std::vector<SearchResult>>& working, size_t sample_size) {
-    GraphStats stats;
+std::tuple<float, float, float> derive_graph_stats(const RaBitQGraph<D>& graph, const std::vector<std::vector<SearchResult>>& working, size_t sample_size) {
     size_t n = working.size();
     size_t actual_sample = std::min(sample_size, n);
     std::mt19937 rng(static_cast<uint32_t>(n ^ sample_size));
@@ -335,11 +360,8 @@ GraphStats derive_graph_stats(const RaBitQGraph<D>& graph, const std::vector<std
     std::vector<float> inter_neighbor_dists;
     std::vector<float> nn_dists;
     neighbor_dists.reserve(actual_sample * GRAPH_DEGREE);
-    inter_neighbor_dists.reserve(actual_sample * GRAPH_DEGREE);
+    inter_neighbor_dists.reserve(actual_sample * GRAPH_DEGREE * (GRAPH_DEGREE - 1) / 2);
     nn_dists.reserve(actual_sample);
-
-    constexpr size_t ISQRT_R = []{ size_t x = GRAPH_DEGREE, y = (x+1)/2; while (y < x) { x = y; y = (x + GRAPH_DEGREE/x)/2; } return x; }();
-    constexpr size_t inter_limit_val = std::min(2 * ISQRT_R, GRAPH_DEGREE);
 
     for (size_t idx : sample_indices) {
         const auto& neighbors = working[idx];
@@ -351,9 +373,9 @@ GraphStats derive_graph_stats(const RaBitQGraph<D>& graph, const std::vector<std
         if (!neighbors.empty() && neighbors[0].id != INVALID_NODE) {
             nn_dists.push_back(neighbors[0].distance);
         }
-        size_t inter_limit = std::min(neighbors.size(), inter_limit_val);
-        for (size_t j = 0; j < inter_limit; ++j) {
-            for (size_t k = j + 1; k < inter_limit; ++k) {
+        size_t nn_count = neighbors.size();
+        for (size_t j = 0; j < nn_count; ++j) {
+            for (size_t k = j + 1; k < nn_count; ++k) {
                 if (neighbors[j].id == INVALID_NODE || neighbors[k].id == INVALID_NODE) continue;
                 float d = graph.distance_between(neighbors[j].id, neighbors[k].id);
                 inter_neighbor_dists.push_back(d);
@@ -384,40 +406,58 @@ GraphStats derive_graph_stats(const RaBitQGraph<D>& graph, const std::vector<std
     std::nth_element(inter_neighbor_dists.begin(), inter_neighbor_dists.begin() + inter_q1_idx, inter_neighbor_dists.end());
     float d_inter = inter_neighbor_dists[inter_q1_idx];
 
-    stats.alpha = neighbor_dist_median / d_inter;
+    float alpha = std::clamp(neighbor_dist_median / d_inter, 1.0f, neighbor_q3_over_q1);
+    float tau = nn_dist_sigma;
+    float alpha_max = neighbor_q3_over_q1;
 
-    stats.alpha_max = neighbor_q3_over_q1;
-    stats.alpha = std::clamp(stats.alpha, 1.0f, stats.alpha_max);
-
-    stats.tau = nn_dist_sigma;
-
-    return stats;
+    return {alpha, tau, alpha_max};
 }
 
 
 template <size_t D, typename EncType>
-void run_reverse_edge_pass(RaBitQGraph<D>& graph, const EncType& encoder, float alpha, float tau, size_t actual_threads, float alpha_max = 0.0f) {
+void run_reverse_edge_pass(RaBitQGraph<D>& graph, const EncType& encoder, float alpha, float tau, size_t actual_threads, float alpha_max) {
     size_t n = graph.size();
 
-    std::vector<std::vector<SearchResult>> reverse_cands(n);
+    std::vector<uint32_t> reverse_offset(n + 1);
+    std::fill_n(reverse_offset.data() + 1, n, uint32_t{0});
+
+    for (size_t u = 0; u < n; ++u) {
+        const auto& nb = graph.get_neighbors(static_cast<NodeId>(u));
+        for (size_t j = 0; j < nb.count; ++j) {
+            NodeId v = nb.neighbor_ids[j];
+            if (v != INVALID_NODE) reverse_offset[v + 1]++;
+        }
+    }
+
+    reverse_offset[0] = 0;
+    for (size_t i = 1; i <= n; ++i)
+        reverse_offset[i] += reverse_offset[i - 1];
+
+    size_t total_reverse = reverse_offset[n];
+    std::vector<SearchResult> reverse_data(total_reverse);
+
     for (size_t u = 0; u < n; ++u) {
         const auto& nb = graph.get_neighbors(static_cast<NodeId>(u));
         for (size_t j = 0; j < nb.count; ++j) {
             NodeId v = nb.neighbor_ids[j];
             if (v == INVALID_NODE) continue;
             float d = graph.distance_between(static_cast<NodeId>(u), v);
-            reverse_cands[v].push_back({static_cast<NodeId>(u), d});
+            reverse_data[reverse_offset[v]++] = {static_cast<NodeId>(u), d};
         }
     }
+
+    for (size_t i = n; i > 0; --i)
+        reverse_offset[i] = reverse_offset[i - 1];
+    reverse_offset[0] = 0;
 
     #pragma omp parallel for schedule(guided) num_threads(actual_threads)
     for (size_t i = 0; i < n; ++i) {
         NodeId v = static_cast<NodeId>(i);
-        if (reverse_cands[v].empty()) continue;
+        if (reverse_offset[i] == reverse_offset[i + 1]) continue;
 
         const auto& nb = graph.get_neighbors(v);
         std::vector<SearchResult> all;
-        all.reserve(nb.count + reverse_cands[v].size());
+        all.reserve(nb.count + (reverse_offset[i + 1] - reverse_offset[i]));
 
         for (size_t j = 0; j < nb.count; ++j) {
             NodeId w = nb.neighbor_ids[j];
@@ -426,9 +466,9 @@ void run_reverse_edge_pass(RaBitQGraph<D>& graph, const EncType& encoder, float 
             all.push_back({w, d});
         }
 
-        for (const auto& cand : reverse_cands[v]) {
-            if (cand.id == v) continue;
-            all.push_back(cand);
+        for (size_t ri = reverse_offset[i]; ri < reverse_offset[i + 1]; ++ri) {
+            if (reverse_data[ri].id == v) continue;
+            all.push_back(reverse_data[ri]);
         }
 
         prune_and_write<D>(graph, encoder, v, all, alpha, tau, alpha_max);
@@ -455,14 +495,20 @@ void optimize_graph_adaptive(RaBitQGraph<D>& graph, const EncType& encoder) {
         new_flags[i].assign(working[i].size(), 1);
     }
 
+    std::vector<SnapshotEntry> snapshot(n);
+    std::vector<uint32_t> reverse_offset(n + 1);
+    std::vector<NodeId> reverse_data(n * GRAPH_DEGREE);
+
     size_t total_edges = n * GRAPH_DEGREE;
 
     size_t updates_0 = nndescent_join_pass<D>(
-        graph, working, new_flags, actual_threads);
+        graph, working, new_flags, actual_threads,
+        snapshot, reverse_offset, reverse_data);
     float rate_0 = static_cast<float>(updates_0) / static_cast<float>(total_edges);
 
     size_t updates_1 = nndescent_join_pass<D>(
-        graph, working, new_flags, actual_threads);
+        graph, working, new_flags, actual_threads,
+        snapshot, reverse_offset, reverse_data);
     float rate_1 = static_cast<float>(updates_1) / static_cast<float>(total_edges);
 
     float decay_ratio = rate_1 / rate_0;
@@ -482,7 +528,8 @@ void optimize_graph_adaptive(RaBitQGraph<D>& graph, const EncType& encoder) {
 
     for (size_t round = 2; ; ++round) {
         size_t updates = nndescent_join_pass<D>(
-            graph, working, new_flags, actual_threads);
+            graph, working, new_flags, actual_threads,
+            snapshot, reverse_offset, reverse_data);
         float rate = static_cast<float>(updates) / static_cast<float>(total_edges);
 
         ema_rate = ema_alpha * rate + (1.0f - ema_alpha) * ema_rate;
@@ -491,11 +538,7 @@ void optimize_graph_adaptive(RaBitQGraph<D>& graph, const EncType& encoder) {
     }
 
     size_t alpha_sample = static_cast<size_t>(std::sqrt(static_cast<double>(n)));
-    GraphStats stats = derive_graph_stats<D>(graph, working, alpha_sample);
-
-    float alpha = stats.alpha;
-    float tau = stats.tau;
-    float alpha_max = stats.alpha_max;
+    auto [alpha, tau, alpha_max] = derive_graph_stats<D>(graph, working, alpha_sample);
 
     #pragma omp parallel for schedule(guided) num_threads(actual_threads)
     for (size_t i = 0; i < n; ++i) {

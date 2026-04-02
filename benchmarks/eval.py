@@ -21,7 +21,8 @@ def recall_at_k(results: np.ndarray, ground_truth: np.ndarray, k: int) -> float:
 
 
 def run_benchmark(repo_id: str,
-                  k: int, n_runs: int, output_dir: Path) -> dict:
+                  k: int, n_runs: int, target_recall: float,
+                  output_dir: Path) -> dict:
     ds = load_dataset(repo_id)
     base = ds["base"]
     queries = ds["queries"]
@@ -35,7 +36,7 @@ def run_benchmark(repo_id: str,
 
     index = evtq.EVTQIndex(dim=dim)
     index.build(base)
-    index.finalize()
+    index.finalize(k=k, target_recall=target_recall)
 
     build_time = time.perf_counter() - t0
     gc.collect()

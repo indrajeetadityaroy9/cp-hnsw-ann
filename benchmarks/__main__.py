@@ -21,9 +21,10 @@ def main(argv: list[str] | None = None) -> None:
     datasets = cfg["data"]["datasets"]
     k = cfg["eval"]["k"]
     n_runs = cfg["eval"]["n_runs"]
+    target_recall = cfg["eval"]["target_recall"]
 
     for repo_id in datasets:
-        output = run_benchmark(repo_id, k, n_runs, output_dir)
+        output = run_benchmark(repo_id, k, n_runs, target_recall, output_dir)
         for algo in output["results"]:
             print(json.dumps({
                 "dataset": output["metadata"]["dataset"],

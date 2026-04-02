@@ -2,9 +2,7 @@
 
 #include "core.hpp"
 #include <array>
-#include <climits>
 #include <cmath>
-#include <algorithm>
 #include <random>
 #include <utility>
 #include <vector>
@@ -94,7 +92,7 @@ inline void fht(float* vec, size_t len) {
 struct RandomHadamardRotation {
     static constexpr size_t NUM_LAYERS = 3;
 
-    explicit RandomHadamardRotation(size_t dim, uint64_t seed = 42)
+    explicit RandomHadamardRotation(size_t dim, uint64_t seed)
         : original_dim_(dim)
         , padded_dim_(next_power_of_two(dim)) {
 
@@ -158,13 +156,15 @@ struct NbitRaBitQEncoder {
     static constexpr int K_INT = (1 << BIT_WIDTH) - 1;
     static constexpr float K = static_cast<float>(K_INT);
 
-    explicit NbitRaBitQEncoder(size_t dim, uint64_t rotation_seed = 42)
+    explicit NbitRaBitQEncoder(size_t dim, uint64_t rotation_seed)
         : dim_(dim)
         , rotation_(dim, rotation_seed)
         , centroid_(dim, 0.0f) {
         float d_float = static_cast<float>(D);
         norm_factor_ = 1.0f / (d_float * std::sqrt(d_float));
         inv_sqrt_d_ = 1.0f / std::sqrt(d_float);
+        dot_slack_ = std::sqrt((static_cast<float>(M_PI) / 2.0f - 1.0f)
+                               / static_cast<float>(K_INT * K_INT * D));
     }
 
     void encode_batch(const float* vecs, size_t num_vecs, CodeType* codes) {
@@ -190,6 +190,7 @@ struct NbitRaBitQEncoder {
         QueryType query;
         rotate_and_normalize(vec, buf.data());
         build_lut(buf.data(), quantized_query.data(), query);
+        query.dot_slack = dot_slack_;
         return query;
     }
 
@@ -216,7 +217,7 @@ struct NbitRaBitQEncoder {
 
         alignas(SIMD_ALIGNMENT) float diff[D];
         result_aux.centered_norm =
-            difference_and_normalize(parent_vec, neighbor_vec, diff);
+            subtract_and_normalize(neighbor_vec, parent_vec, diff);
 
         alignas(SIMD_ALIGNMENT) float rotated[D];
         rotate_and_normalize(diff, rotated);
@@ -228,15 +229,11 @@ struct NbitRaBitQEncoder {
         return {std::move(result_code), result_aux};
     }
 
-    float compute_dot_slack() const {
-        return std::sqrt((static_cast<float>(M_PI) / 2.0f - 1.0f)
-                         / static_cast<float>((1u << (2 * BIT_WIDTH)) * D));
-    }
-
     size_t dim_;
     RandomHadamardRotation rotation_;
     float norm_factor_;
     float inv_sqrt_d_;
+    float dot_slack_;
     std::vector<float> centroid_;
 
     void compute_centroid(const float* vecs, size_t num_vecs) {
@@ -254,14 +251,13 @@ struct NbitRaBitQEncoder {
     }
 
     void build_lut(const float* buf, uint8_t* quantized_query, QueryType& query) const {
-        constexpr float LUT_LEVELS = static_cast<float>((1 << (CHAR_BIT / 2)) - 1);
         float lut_min = buf[0], lut_max = buf[0];
         for (size_t i = 1; i < D; ++i) {
             if (buf[i] < lut_min) lut_min = buf[i];
             if (buf[i] > lut_max) lut_max = buf[i];
         }
 
-        float delta = (lut_max - lut_min) / LUT_LEVELS;
+        float delta = (lut_max - lut_min) / K;
         float inv_delta = 1.0f / delta;
 
         float quantized_sum = 0.0f;
@@ -294,40 +290,61 @@ struct NbitRaBitQEncoder {
         CodeType code;
         code.clear();
 
-        code.centered_norm = center_and_normalize(vec, centered_buf);
+        code.centered_norm = subtract_and_normalize(vec, centroid_.data(), centered_buf);
         rotate_and_normalize(centered_buf, buf);
 
         code.code_ip = caq_quantize(buf, code.codes);
         return code;
     }
 
-    float center_and_normalize(const float* vec, float* out) const {
-        float norm_sq = 0.0f;
-        for (size_t i = 0; i < dim_; ++i) {
-            float centered = vec[i] - centroid_[i];
-            out[i] = centered;
-            norm_sq += centered * centered;
+    float subtract_and_normalize(const float* a, const float* b, float* out) const {
+#ifdef __AVX512F__
+        __m512 vsum = _mm512_setzero_ps();
+        size_t i = 0;
+        for (; i + 16 <= dim_; i += 16) {
+            __m512 va = _mm512_loadu_ps(a + i);
+            __m512 vb = _mm512_loadu_ps(b + i);
+            __m512 vd = _mm512_sub_ps(va, vb);
+            _mm512_storeu_ps(out + i, vd);
+            vsum = _mm512_fmadd_ps(vd, vd, vsum);
         }
-        for (size_t i = dim_; i < D; ++i) out[i] = 0.0f;
+        float norm_sq = _mm512_reduce_add_ps(vsum);
+        for (; i < dim_; ++i) {
+            float d = a[i] - b[i];
+            out[i] = d;
+            norm_sq += d * d;
+        }
+        for (size_t j = dim_; j < D; ++j) out[j] = 0.0f;
 
         float norm = std::sqrt(norm_sq);
         float inv_norm = 1.0f / norm;
-        for (size_t i = 0; i < D; ++i) out[i] *= inv_norm;
-        return norm;
-    }
-
-    float difference_and_normalize(const float* from, const float* to, float* out) const {
-        float norm_sq = 0.0f;
-        for (size_t i = 0; i < dim_; ++i) {
-            float diff = to[i] - from[i];
-            out[i] = diff;
-            norm_sq += diff * diff;
+        __m512 vinv = _mm512_set1_ps(inv_norm);
+        for (size_t j = 0; j < D; j += 16)
+            _mm512_storeu_ps(out + j, _mm512_mul_ps(_mm512_loadu_ps(out + j), vinv));
+#else
+        __m256 vsum = _mm256_setzero_ps();
+        size_t i = 0;
+        for (; i + 8 <= dim_; i += 8) {
+            __m256 va = _mm256_loadu_ps(a + i);
+            __m256 vb = _mm256_loadu_ps(b + i);
+            __m256 vd = _mm256_sub_ps(va, vb);
+            _mm256_storeu_ps(out + i, vd);
+            vsum = _mm256_fmadd_ps(vd, vd, vsum);
         }
-        for (size_t i = dim_; i < D; ++i) out[i] = 0.0f;
+        float norm_sq = hsum256(vsum);
+        for (; i < dim_; ++i) {
+            float d = a[i] - b[i];
+            out[i] = d;
+            norm_sq += d * d;
+        }
+        for (size_t j = dim_; j < D; ++j) out[j] = 0.0f;
 
         float norm = std::sqrt(norm_sq);
         float inv_norm = 1.0f / norm;
-        for (size_t i = 0; i < D; ++i) out[i] *= inv_norm;
+        __m256 vinv = _mm256_set1_ps(inv_norm);
+        for (size_t j = 0; j < D; j += 8)
+            _mm256_storeu_ps(out + j, _mm256_mul_ps(_mm256_loadu_ps(out + j), vinv));
+#endif
         return norm;
     }
 
@@ -340,8 +357,7 @@ struct NbitRaBitQEncoder {
         float range = buf_max - buf_min;
         float inv_range = 1.0f / range;
 
-        thread_local std::vector<int> levels;
-        levels.resize(D);
+        int levels[D];
 
         float code_vec_ip = 0.0f, code_norm_sq = 0.0f;
         for (size_t i = 0; i < D; ++i) {
@@ -388,16 +404,16 @@ struct NbitRaBitQEncoder {
             prev_cosine_sq = cosine_sq;
         }
 
-        float code_ip = 0.0f;
         float code_parent_ip = 0.0f;
         for (size_t i = 0; i < D; ++i) {
             out_code.set_value(i, static_cast<uint8_t>(levels[i]));
-            float coeff = (2.0f * levels[i] - K) / K;
-            code_ip += coeff * rotated_buf[i];
-            if (rotated_parent) code_parent_ip += coeff * rotated_parent[i];
+            if (rotated_parent) {
+                float coeff = (2.0f * levels[i] - K) / K;
+                code_parent_ip += coeff * rotated_parent[i];
+            }
         }
         if (out_code_parent_ip) *out_code_parent_ip = code_parent_ip * inv_sqrt_d_;
-        return code_ip * inv_sqrt_d_;
+        return code_vec_ip * inv_sqrt_d_;
     }
 };
 

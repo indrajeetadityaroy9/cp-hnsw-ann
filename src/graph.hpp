@@ -93,8 +93,6 @@ struct RaBitQGraph {
 
     const float* get_vector(NodeId id) const { return raw_vectors_[id].data(); }
 
-    float get_norm_sq(NodeId id) const { return norm_sq_[id]; }
-
     float distance_between(NodeId a, NodeId b) const {
         return l2_distance_simd<D>(raw_vectors_[a].data(), raw_vectors_[b].data());
     }

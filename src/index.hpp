@@ -18,8 +18,19 @@
 
 namespace evtq {
 
+struct IndexBase {
+    virtual ~IndexBase() = default;
+    virtual void build(std::span<const float> vecs, size_t num_vecs) = 0;
+    virtual void finalize(size_t k, float target_recall) = 0;
+    virtual std::vector<SearchResult> search(std::span<const float> query, size_t k) const = 0;
+    virtual size_t size() const = 0;
+    virtual size_t dim() const = 0;
+    virtual void save(const std::string& path) const = 0;
+    virtual void load(const std::string& path) = 0;
+};
+
 template <size_t D>
-struct Index {
+struct Index : IndexBase {
     using CodeType = NbitRaBitQCode<D>;
     using QueryType = RaBitQQuery<D>;
     using Encoder = NbitRaBitQEncoder<D>;
@@ -32,11 +43,10 @@ struct Index {
         , graph_(dim)
     {}
 
-    void build(std::span<const float> vecs, size_t num_vecs) {
+    void build(std::span<const float> vecs, size_t num_vecs) override {
         std::unique_lock<std::shared_mutex> lock(index_mutex_);
 
         graph_ = Graph(dim_);
-        calibration_ = {};
 
         graph_.reserve(num_vecs);
 
@@ -48,15 +58,15 @@ struct Index {
         }
     }
 
-    void finalize() {
+    void finalize(size_t k, float target_recall) override {
         std::unique_lock<std::shared_mutex> lock(index_mutex_);
         graph_refinement::optimize_graph_adaptive(graph_, encoder_);
-        compute_calibration();
+        calibration_ = qrct::calibrate<D>(graph_, encoder_, k, target_recall);
     }
 
     std::vector<SearchResult> search(
         std::span<const float> query,
-        size_t k) const
+        size_t k) const override
     {
         std::shared_lock<std::shared_mutex> lock(index_mutex_);
 
@@ -69,8 +79,6 @@ struct Index {
         const float* query_vec = query_padded.data();
 
         QueryType encoded = encoder_.encode_query_raw(query_vec);
-        encoded.dot_slack = calibration_.dot_slack;
-        float gamma = calibration_.gamma;
 
         thread_local TwoLevelVisitationTable visited(0);
         if (visited.capacity() < graph_.size()) {
@@ -79,13 +87,13 @@ struct Index {
 
         NodeId ep = graph_.entry_point();
         return rabitq_search::search<D>(
-            encoded, query_vec, graph_, k, gamma, visited, ep);
+            encoded, query_vec, graph_, k, visited, ep, calibration_);
     }
 
-    size_t size() const { return graph_.size(); }
-    size_t dim() const { return dim_; }
+    size_t size() const override { return graph_.size(); }
+    size_t dim() const override { return dim_; }
 
-    void save(const std::string& path) const {
+    void save(const std::string& path) const override {
         std::shared_lock<std::shared_mutex> lock(index_mutex_);
         std::ofstream f(path, std::ios::binary);
 
@@ -97,8 +105,7 @@ struct Index {
         write_raw(&hdr_n, sizeof(hdr_n));
         NodeId ep = graph_.entry_point();
         write_raw(&ep, sizeof(ep));
-        write_raw(&calibration_, sizeof(CalibrationSnapshot));
-
+        write_raw(&calibration_, sizeof(QRCTCalibration));
         const auto& centroid = encoder_.get_centroid();
         write_raw(centroid.data(), dim_ * sizeof(float));
 
@@ -118,7 +125,7 @@ struct Index {
         }
     }
 
-    void load(const std::string& path) {
+    void load(const std::string& path) override {
         std::unique_lock<std::shared_mutex> lock(index_mutex_);
         std::ifstream f(path, std::ios::binary);
 
@@ -130,9 +137,7 @@ struct Index {
         read_raw(&hdr_n, sizeof(hdr_n));
         NodeId ep;
         read_raw(&ep, sizeof(ep));
-
-        CalibrationSnapshot new_calib;
-        read_raw(&new_calib, sizeof(CalibrationSnapshot));
+        read_raw(&calibration_, sizeof(QRCTCalibration));
 
         size_t n = static_cast<size_t>(hdr_n);
 
@@ -161,20 +166,13 @@ struct Index {
             ep);
 
         encoder_.set_centroid(std::move(new_centroid));
-        calibration_ = new_calib;
     }
 
     size_t dim_;
     Encoder encoder_;
     Graph graph_;
-    CalibrationSnapshot calibration_;
+    QRCTCalibration calibration_;
     mutable std::shared_mutex index_mutex_;
-
-    void compute_calibration() {
-        float dot_slack = encoder_.compute_dot_slack();
-        calibration_ = calibration::calibrate<D>(
-            graph_, encoder_, dot_slack);
-    }
 };
 
 }
