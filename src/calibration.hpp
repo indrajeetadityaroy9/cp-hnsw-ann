@@ -69,9 +69,7 @@ QRCTCalibration calibrate(
         padded_queries[si].resize(D);
         const float* qvec = graph.get_vector(static_cast<NodeId>(indices[si]));
         std::copy_n(qvec, graph.dim_, padded_queries[si].data());
-        if (graph.dim_ < D) {
-            std::fill_n(padded_queries[si].data() + graph.dim_, D - graph.dim_, 0.0f);
-        }
+        std::fill_n(padded_queries[si].data() + graph.dim_, D - graph.dim_, 0.0f);
         encoded_queries[si] = encoder.encode_query_raw(padded_queries[si].data());
     }
 
@@ -122,9 +120,10 @@ QRCTCalibration calibrate(
 
     auto cal = fit_gpd(ratios);
 
-    // Ground truth via exhaustive search (delta = max)
+    // Ground truth via exhaustive search (negative delta is unreachable by
+    // non-negative R_B, forcing the beam search to drain completely)
     QRCTCalibration cal_open = cal;
-    cal_open.delta = std::numeric_limits<float>::max();
+    cal_open.delta = -1.0f;
 
     std::vector<std::vector<NodeId>> ground_truth(num_probes);
 

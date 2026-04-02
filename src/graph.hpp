@@ -48,9 +48,7 @@ struct RaBitQGraph {
 
         raw_vectors_.emplace_back();
         std::copy_n(vec.data(), dim_, raw_vectors_.back().data());
-        if (dim_ < D) {
-            std::fill_n(raw_vectors_.back().data() + dim_, D - dim_, 0.0f);
-        }
+        std::fill_n(raw_vectors_.back().data() + dim_, D - dim_, 0.0f);
 
         const float* stored = raw_vectors_.back().data();
         float nsq = dot_product_simd<D>(stored, stored);

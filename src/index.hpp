@@ -8,8 +8,6 @@
 #include "search.hpp"
 #include <algorithm>
 #include <fstream>
-#include <mutex>
-#include <shared_mutex>
 #include <span>
 #include <string>
 #include <vector>
@@ -44,8 +42,6 @@ struct Index : IndexBase {
     {}
 
     void build(std::span<const float> vecs, size_t num_vecs) override {
-        std::unique_lock<std::shared_mutex> lock(index_mutex_);
-
         graph_ = Graph(dim_);
 
         graph_.reserve(num_vecs);
@@ -59,7 +55,6 @@ struct Index : IndexBase {
     }
 
     void finalize(size_t k, float target_recall) override {
-        std::unique_lock<std::shared_mutex> lock(index_mutex_);
         graph_refinement::optimize_graph_adaptive(graph_, encoder_);
         size_t num_probes = static_cast<size_t>(
             std::ceil(std::sqrt(static_cast<double>(graph_.size()))));
@@ -70,14 +65,10 @@ struct Index : IndexBase {
         std::span<const float> query,
         size_t k) const override
     {
-        std::shared_lock<std::shared_mutex> lock(index_mutex_);
-
         thread_local AlignedVector<float> query_padded;
         query_padded.resize(D);
         std::copy_n(query.data(), dim_, query_padded.data());
-        if (dim_ < D) {
-            std::fill_n(query_padded.data() + dim_, D - dim_, 0.0f);
-        }
+        std::fill_n(query_padded.data() + dim_, D - dim_, 0.0f);
         const float* query_vec = query_padded.data();
 
         QueryType encoded = encoder_.encode_query_raw(query_vec);
@@ -96,7 +87,6 @@ struct Index : IndexBase {
     size_t dim() const override { return dim_; }
 
     void save(const std::string& path) const override {
-        std::shared_lock<std::shared_mutex> lock(index_mutex_);
         std::ofstream f(path, std::ios::binary);
 
         auto write_raw = [&](const void* data, size_t bytes) {
@@ -128,7 +118,6 @@ struct Index : IndexBase {
     }
 
     void load(const std::string& path) override {
-        std::unique_lock<std::shared_mutex> lock(index_mutex_);
         std::ifstream f(path, std::ios::binary);
 
         auto read_raw = [&](void* data, size_t bytes) {
@@ -174,7 +163,6 @@ struct Index : IndexBase {
     Encoder encoder_;
     Graph graph_;
     QRCTCalibration calibration_;
-    mutable std::shared_mutex index_mutex_;
 };
 
 }
