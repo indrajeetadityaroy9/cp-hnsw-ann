@@ -56,12 +56,10 @@ PYBIND11_MODULE(evtq, m) {
         },
         py::arg("vectors"))
 
-        .def("finalize", [](IndexBase& self, size_t k, float target_recall) {
+        .def("finalize", [](IndexBase& self) {
             py::gil_scoped_release release;
-            self.finalize(k, target_recall);
-        },
-        py::arg("k"),
-        py::arg("target_recall"))
+            self.finalize();
+        })
 
         .def("search", [](const IndexBase& self,
                           py::array_t<float, py::array::c_style | py::array::forcecast> query,
@@ -74,6 +72,60 @@ PYBIND11_MODULE(evtq, m) {
             {
                 py::gil_scoped_release release;
                 results = self.search(std::span<const float>{ptr, len}, k);
+            }
+
+            const size_t n = results.size();
+            py::array_t<int64_t> ids(n);
+            py::array_t<float> distances(n);
+            auto* ids_ptr = ids.mutable_data();
+            auto* dist_ptr = distances.mutable_data();
+            for (size_t i = 0; i < n; ++i) {
+                ids_ptr[i] = results[i].id;
+                dist_ptr[i] = results[i].distance;
+            }
+            return std::make_pair(ids, distances);
+        },
+        py::arg("query"),
+        py::arg("k") = 10)
+
+        .def("search_exhaustive", [](const IndexBase& self,
+                          py::array_t<float, py::array::c_style | py::array::forcecast> query,
+                          size_t k) {
+            auto buf = query.request();
+            auto ptr = static_cast<const float*>(buf.ptr);
+            auto len = static_cast<size_t>(buf.size);
+
+            std::vector<SearchResult> results;
+            {
+                py::gil_scoped_release release;
+                results = self.search_exhaustive(std::span<const float>{ptr, len}, k);
+            }
+
+            const size_t n = results.size();
+            py::array_t<int64_t> ids(n);
+            py::array_t<float> distances(n);
+            auto* ids_ptr = ids.mutable_data();
+            auto* dist_ptr = distances.mutable_data();
+            for (size_t i = 0; i < n; ++i) {
+                ids_ptr[i] = results[i].id;
+                dist_ptr[i] = results[i].distance;
+            }
+            return std::make_pair(ids, distances);
+        },
+        py::arg("query"),
+        py::arg("k") = 10)
+
+        .def("search_graph_ceiling", [](const IndexBase& self,
+                          py::array_t<float, py::array::c_style | py::array::forcecast> query,
+                          size_t k) {
+            auto buf = query.request();
+            auto ptr = static_cast<const float*>(buf.ptr);
+            auto len = static_cast<size_t>(buf.size);
+
+            std::vector<SearchResult> results;
+            {
+                py::gil_scoped_release release;
+                results = self.search_graph_ceiling(std::span<const float>{ptr, len}, k);
             }
 
             const size_t n = results.size();

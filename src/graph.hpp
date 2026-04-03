@@ -30,8 +30,6 @@ struct RaBitQGraph {
     using NeighborBlockType = typename SearchDataType::NeighborBlockType;
     using RawVector = std::array<float, D>;
 
-    static constexpr size_t DIMS = D;
-
     explicit RaBitQGraph(size_t dim)
         : dim_(dim) {
     }
@@ -111,14 +109,9 @@ struct RaBitQGraph {
         return search_data_[id].neighbors;
     }
 
-    static constexpr size_t FIRST_BATCH_BYTES =
-        sizeof(CodeType) + sizeof(NbitFastScanCodeBlock<D>);
-    static constexpr size_t MAX_USEFUL_LINES =
-        (FIRST_BATCH_BYTES + CACHE_LINE_SIZE - 1) / CACHE_LINE_SIZE;
-    static constexpr size_t TOTAL_VERTEX_LINES =
-        sizeof(SearchDataType) / CACHE_LINE_SIZE;
-    static constexpr size_t PREFETCH_LINES =
-        (TOTAL_VERTEX_LINES < MAX_USEFUL_LINES) ? TOTAL_VERTEX_LINES : MAX_USEFUL_LINES;
+    static constexpr size_t PREFETCH_LINES = std::min(
+        sizeof(SearchDataType) / CACHE_LINE_SIZE,
+        (sizeof(CodeType) + sizeof(NbitFastScanCodeBlock<D>) + CACHE_LINE_SIZE - 1) / CACHE_LINE_SIZE);
 
     void prefetch_vertex(NodeId id) const {
         const char* base = reinterpret_cast<const char*>(&search_data_[id]);
@@ -129,11 +122,10 @@ struct RaBitQGraph {
 
     void prefetch_vector(NodeId id) const {
         const char* base = reinterpret_cast<const char*>(raw_vectors_[id].data());
-        constexpr size_t VEC_LINES = (D * sizeof(float) + CACHE_LINE_SIZE - 1) / CACHE_LINE_SIZE;
-        constexpr size_t DOT_FIRST_ITER_LINES = (32 * sizeof(float) + CACHE_LINE_SIZE - 1) / CACHE_LINE_SIZE;
-        constexpr size_t MAX_VEC_LINES = (VEC_LINES < 2 * DOT_FIRST_ITER_LINES)
-            ? VEC_LINES : 2 * DOT_FIRST_ITER_LINES;
-        for (size_t line = 0; line < MAX_VEC_LINES; ++line) {
+        constexpr size_t LINES = std::min(
+            (D * sizeof(float) + CACHE_LINE_SIZE - 1) / CACHE_LINE_SIZE,
+            2 * ((32 * sizeof(float) + CACHE_LINE_SIZE - 1) / CACHE_LINE_SIZE));
+        for (size_t line = 0; line < LINES; ++line) {
             prefetch_t<1>(base + line * CACHE_LINE_SIZE);
         }
     }

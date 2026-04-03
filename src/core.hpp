@@ -196,7 +196,6 @@ struct VertexAuxData {
 
 template <size_t D>
 struct RaBitQQuery {
-    static constexpr size_t DIMS = D;
     static constexpr size_t NUM_SUB_SEGMENTS = num_sub_segments<D>;
 
     alignas(SIMD_ALIGNMENT) uint8_t lut[NUM_SUB_SEGMENTS][16];
@@ -259,8 +258,6 @@ struct alignas(SIMD_ALIGNMENT) NbitCodeStorage {
 
 template <size_t D>
 struct NbitRaBitQCode {
-    static constexpr size_t DIMS = D;
-
     NbitCodeStorage<D> codes;
     float centered_norm;
     float code_ip;
@@ -272,17 +269,16 @@ struct NbitRaBitQCode {
     }
 };
 
-struct QRCTCalibration {
+struct GPDCalibration {
     float xi;
     float sigma;
     float u;
     float p_u;
-    float delta;
 };
 
-namespace qrct {
+namespace rcgr {
 
-inline float gpd_survival(float t, const QRCTCalibration& cal) {
+inline float gpd_survival(float t, const GPDCalibration& cal) {
     if (t <= cal.u) return cal.p_u;
     float excess = (t - cal.u) / cal.sigma;
     if (cal.xi == 0.0f) return cal.p_u * std::exp(-excess);

@@ -19,8 +19,10 @@ namespace evtq {
 struct IndexBase {
     virtual ~IndexBase() = default;
     virtual void build(std::span<const float> vecs, size_t num_vecs) = 0;
-    virtual void finalize(size_t k, float target_recall) = 0;
+    virtual void finalize() = 0;
     virtual std::vector<SearchResult> search(std::span<const float> query, size_t k) const = 0;
+    virtual std::vector<SearchResult> search_exhaustive(std::span<const float> query, size_t k) const = 0;
+    virtual std::vector<SearchResult> search_graph_ceiling(std::span<const float> query, size_t k) const = 0;
     virtual size_t size() const = 0;
     virtual size_t dim() const = 0;
     virtual void save(const std::string& path) const = 0;
@@ -33,8 +35,6 @@ struct Index : IndexBase {
     using QueryType = RaBitQQuery<D>;
     using Encoder = NbitRaBitQEncoder<D>;
     using Graph = RaBitQGraph<D>;
-    static constexpr size_t DIMS = D;
-
     explicit Index(size_t dim)
         : dim_(dim)
         , encoder_(dim, static_cast<uint64_t>(dim) * D)
@@ -54,33 +54,68 @@ struct Index : IndexBase {
         }
     }
 
-    void finalize(size_t k, float target_recall) override {
-        graph_refinement::optimize_graph_adaptive(graph_, encoder_);
+    void finalize() override {
+        graph_refinement::vamana_build(graph_, encoder_);
         size_t num_probes = static_cast<size_t>(
             std::ceil(std::sqrt(static_cast<double>(graph_.size()))));
-        calibration_ = qrct::calibrate<D>(graph_, encoder_, k, target_recall, num_probes);
+        calibration_ = rcgr::calibrate<D>(graph_, encoder_, num_probes);
     }
 
     std::vector<SearchResult> search(
         std::span<const float> query,
         size_t k) const override
     {
-        thread_local AlignedVector<float> query_padded;
-        query_padded.resize(D);
-        std::copy_n(query.data(), dim_, query_padded.data());
-        std::fill_n(query_padded.data() + dim_, D - dim_, 0.0f);
-        const float* query_vec = query_padded.data();
+        alignas(SIMD_ALIGNMENT) float query_padded[D];
+        std::copy_n(query.data(), dim_, query_padded);
+        std::fill_n(query_padded + dim_, D - dim_, 0.0f);
 
-        QueryType encoded = encoder_.encode_query_raw(query_vec);
+        QueryType encoded = encoder_.encode_query_raw(query_padded);
 
-        thread_local TwoLevelVisitationTable visited(0);
+        thread_local VisitationTable visited(0);
         if (visited.capacity() < graph_.size()) {
             visited.resize(graph_.size());
         }
 
         NodeId ep = graph_.entry_point();
         return rabitq_search::search<D>(
-            encoded, query_vec, graph_, k, visited, ep, calibration_);
+            encoded, query_padded, graph_, k, visited, ep, calibration_);
+    }
+
+    std::vector<SearchResult> search_exhaustive(
+        std::span<const float> query,
+        size_t k) const override
+    {
+        alignas(SIMD_ALIGNMENT) float query_padded[D];
+        std::copy_n(query.data(), dim_, query_padded);
+        std::fill_n(query_padded + dim_, D - dim_, 0.0f);
+
+        QueryType encoded = encoder_.encode_query_raw(query_padded);
+
+        thread_local VisitationTable visited(0);
+        if (visited.capacity() < graph_.size()) {
+            visited.resize(graph_.size());
+        }
+
+        GPDCalibration exhaustive_cal{0.0f, 1.0f, 1e30f, 1e6f};
+        return rabitq_search::search<D>(
+            encoded, query_padded, graph_, k, visited, graph_.entry_point(), exhaustive_cal);
+    }
+
+    std::vector<SearchResult> search_graph_ceiling(
+        std::span<const float> query,
+        size_t k) const override
+    {
+        alignas(SIMD_ALIGNMENT) float query_padded[D];
+        std::copy_n(query.data(), dim_, query_padded);
+        std::fill_n(query_padded + dim_, D - dim_, 0.0f);
+
+        thread_local VisitationTable visited(0);
+        if (visited.capacity() < graph_.size()) {
+            visited.resize(graph_.size());
+        }
+
+        return rabitq_search::search_graph_ceiling<D>(
+            query_padded, graph_, k, visited, graph_.entry_point());
     }
 
     size_t size() const override { return graph_.size(); }
@@ -97,7 +132,7 @@ struct Index : IndexBase {
         write_raw(&hdr_n, sizeof(hdr_n));
         NodeId ep = graph_.entry_point();
         write_raw(&ep, sizeof(ep));
-        write_raw(&calibration_, sizeof(QRCTCalibration));
+        write_raw(&calibration_, sizeof(GPDCalibration));
         const auto& centroid = encoder_.get_centroid();
         write_raw(centroid.data(), dim_ * sizeof(float));
 
@@ -128,7 +163,7 @@ struct Index : IndexBase {
         read_raw(&hdr_n, sizeof(hdr_n));
         NodeId ep;
         read_raw(&ep, sizeof(ep));
-        read_raw(&calibration_, sizeof(QRCTCalibration));
+        read_raw(&calibration_, sizeof(GPDCalibration));
 
         size_t n = static_cast<size_t>(hdr_n);
 
@@ -162,7 +197,7 @@ struct Index : IndexBase {
     size_t dim_;
     Encoder encoder_;
     Graph graph_;
-    QRCTCalibration calibration_;
+    GPDCalibration calibration_;
 };
 
 }

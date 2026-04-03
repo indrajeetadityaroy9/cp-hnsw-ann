@@ -4,7 +4,6 @@
 #include "encoder.hpp"
 #include "estimator.hpp"
 #include "graph.hpp"
-#include "search.hpp"
 
 #include <algorithm>
 #include <numeric>
@@ -13,9 +12,9 @@
 
 #include <omp.h>
 
-namespace evtq::qrct {
+namespace evtq::rcgr {
 
-inline QRCTCalibration fit_gpd(const std::vector<float>& sorted_ratios) {
+inline GPDCalibration fit_gpd(const std::vector<float>& sorted_ratios) {
     size_t m = sorted_ratios.size();
 
     double sum = 0.0;
@@ -41,11 +40,11 @@ inline QRCTCalibration fit_gpd(const std::vector<float>& sorted_ratios) {
     float sigma = static_cast<float>(b0) * (1.0f - xi);
 
     float p_u = static_cast<float>(n_exc) / static_cast<float>(m);
-    return {xi, sigma, u, p_u, 0.0f};
+    return {xi, sigma, u, p_u};
 }
 
 template <size_t D>
-QRCTCalibration calibrate(const RaBitQGraph<D>& graph, const NbitRaBitQEncoder<D>& encoder, size_t k, float target_recall, size_t num_probes) {
+GPDCalibration calibrate(const RaBitQGraph<D>& graph, const NbitRaBitQEncoder<D>& encoder, size_t num_probes) {
     size_t n = graph.size();
 
     std::mt19937 rng(static_cast<uint32_t>(n));
@@ -54,7 +53,6 @@ QRCTCalibration calibrate(const RaBitQGraph<D>& graph, const NbitRaBitQEncoder<D
     std::shuffle(indices.begin(), indices.end(), rng);
     indices.resize(num_probes);
 
-    // Encode probe queries
     std::vector<AlignedVector<float>> padded_queries(num_probes);
     std::vector<RaBitQQuery<D>> encoded_queries(num_probes);
     for (size_t si = 0; si < num_probes; ++si) {
@@ -65,7 +63,6 @@ QRCTCalibration calibrate(const RaBitQGraph<D>& graph, const NbitRaBitQEncoder<D
         encoded_queries[si] = encoder.encode_query_raw(padded_queries[si].data());
     }
 
-    // Collect estimation-error ratios from probe neighborhoods
     int num_threads = omp_get_max_threads();
     std::vector<std::vector<float>> per_thread(num_threads);
 
@@ -91,7 +88,7 @@ QRCTCalibration calibrate(const RaBitQGraph<D>& graph, const NbitRaBitQEncoder<D
 
                 const auto& pnb = graph.get_neighbors(pid);
                 size_t nn = pnb.size();
-                estimator::estimate_all_neighbors<D>(encoded_queries[si], pnb, dqp, estimates);
+                estimator::estimate_neighbors<D>(encoded_queries[si], pnb, dqp, 0.0f, false, estimates);
 
                 for (size_t i = 0; i < nn; ++i) {
                     NodeId nid = pnb.neighbor_ids[i];
@@ -110,69 +107,7 @@ QRCTCalibration calibrate(const RaBitQGraph<D>& graph, const NbitRaBitQEncoder<D
     for (auto& v : per_thread) ratios.insert(ratios.end(), v.begin(), v.end());
     std::sort(ratios.begin(), ratios.end());
 
-    auto cal = fit_gpd(ratios);
-
-    // Ground truth via exhaustive search (negative delta is unreachable by
-    // non-negative R_B, forcing the beam search to drain completely)
-    QRCTCalibration cal_open = cal;
-    cal_open.delta = -1.0f;
-
-    std::vector<std::vector<NodeId>> ground_truth(num_probes);
-
-    #pragma omp parallel
-    {
-        thread_local TwoLevelVisitationTable visited(0);
-        if (visited.capacity() < n) visited.resize(n);
-
-        #pragma omp for schedule(guided)
-        for (size_t si = 0; si < num_probes; ++si) {
-            auto full = rabitq_search::search<D>(encoded_queries[si], padded_queries[si].data(), graph, k, visited, graph.entry_point(), cal_open);
-            ground_truth[si].reserve(full.size());
-            for (const auto& sr : full) ground_truth[si].push_back(sr.id);
-        }
-    }
-
-    // Binary search for delta
-    float lo = 0.0f;
-    float hi = static_cast<float>(k);
-    float inv_k = 1.0f / static_cast<float>(k);
-
-    while (hi - lo >= inv_k) {
-        float mid = (lo + hi) * 0.5f;
-        QRCTCalibration cal_test = cal;
-        cal_test.delta = mid;
-
-        float total_recall = 0.0f;
-
-        #pragma omp parallel reduction(+:total_recall)
-        {
-            thread_local TwoLevelVisitationTable visited(0);
-            if (visited.capacity() < n) visited.resize(n);
-
-            #pragma omp for schedule(guided)
-            for (size_t si = 0; si < num_probes; ++si) {
-                auto term = rabitq_search::search<D>(encoded_queries[si], padded_queries[si].data(), graph, k, visited, graph.entry_point(), cal_test);
-
-                size_t hits = 0;
-                for (const auto& sr : term) {
-                    for (NodeId fid : ground_truth[si]) {
-                        if (sr.id == fid) { ++hits; break; }
-                    }
-                }
-                total_recall += static_cast<float>(hits) / static_cast<float>(ground_truth[si].size());
-            }
-        }
-
-        float mean_recall = total_recall / static_cast<float>(num_probes);
-        if (mean_recall >= target_recall) {
-            lo = mid;
-        } else {
-            hi = mid;
-        }
-    }
-
-    cal.delta = lo;
-    return cal;
+    return fit_gpd(ratios);
 }
 
 }

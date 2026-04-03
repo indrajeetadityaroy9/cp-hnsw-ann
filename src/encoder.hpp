@@ -155,7 +155,6 @@ template <size_t D>
 struct NbitRaBitQEncoder {
     using CodeType = NbitRaBitQCode<D>;
     using QueryType = RaBitQQuery<D>;
-    static constexpr size_t DIMS = D;
     static constexpr size_t NUM_SUB_SEGMENTS = num_sub_segments<D>;
     static constexpr int K_INT = (1 << BIT_WIDTH) - 1;
     static constexpr float K = static_cast<float>(K_INT);
@@ -186,12 +185,12 @@ struct NbitRaBitQEncoder {
     }
 
     QueryType encode_query_raw(const float* vec) const {
-        thread_local AlignedVector<float> buf(D);
-        thread_local AlignedVector<uint8_t> quantized_query(D);
+        alignas(SIMD_ALIGNMENT) float buf[D];
+        alignas(SIMD_ALIGNMENT) uint8_t quantized_query[D];
 
         QueryType query;
-        rotate_and_normalize(vec, buf.data());
-        build_lut(buf.data(), quantized_query.data(), query);
+        rotate_and_normalize(vec, buf);
+        build_lut(buf, quantized_query, query);
         query.dot_slack = dot_slack_;
         return query;
     }
