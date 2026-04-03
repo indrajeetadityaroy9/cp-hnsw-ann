@@ -21,8 +21,6 @@ struct IndexBase {
     virtual void build(std::span<const float> vecs, size_t num_vecs) = 0;
     virtual void finalize() = 0;
     virtual std::vector<SearchResult> search(std::span<const float> query, size_t k) const = 0;
-    virtual std::vector<SearchResult> search_exhaustive(std::span<const float> query, size_t k) const = 0;
-    virtual std::vector<SearchResult> search_graph_ceiling(std::span<const float> query, size_t k) const = 0;
     virtual size_t size() const = 0;
     virtual size_t dim() const = 0;
     virtual void save(const std::string& path) const = 0;
@@ -79,43 +77,6 @@ struct Index : IndexBase {
         NodeId ep = graph_.entry_point();
         return rabitq_search::search<D>(
             encoded, query_padded, graph_, k, visited, ep, calibration_);
-    }
-
-    std::vector<SearchResult> search_exhaustive(
-        std::span<const float> query,
-        size_t k) const override
-    {
-        alignas(SIMD_ALIGNMENT) float query_padded[D];
-        std::copy_n(query.data(), dim_, query_padded);
-        std::fill_n(query_padded + dim_, D - dim_, 0.0f);
-
-        QueryType encoded = encoder_.encode_query_raw(query_padded);
-
-        thread_local VisitationTable visited(0);
-        if (visited.capacity() < graph_.size()) {
-            visited.resize(graph_.size());
-        }
-
-        GPDCalibration exhaustive_cal{0.0f, 1.0f, 1e30f, 1e6f};
-        return rabitq_search::search<D>(
-            encoded, query_padded, graph_, k, visited, graph_.entry_point(), exhaustive_cal);
-    }
-
-    std::vector<SearchResult> search_graph_ceiling(
-        std::span<const float> query,
-        size_t k) const override
-    {
-        alignas(SIMD_ALIGNMENT) float query_padded[D];
-        std::copy_n(query.data(), dim_, query_padded);
-        std::fill_n(query_padded + dim_, D - dim_, 0.0f);
-
-        thread_local VisitationTable visited(0);
-        if (visited.capacity() < graph_.size()) {
-            visited.resize(graph_.size());
-        }
-
-        return rabitq_search::search_graph_ceiling<D>(
-            query_padded, graph_, k, visited, graph_.entry_point());
     }
 
     size_t size() const override { return graph_.size(); }
