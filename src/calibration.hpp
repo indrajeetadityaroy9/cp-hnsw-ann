@@ -4,12 +4,10 @@
 #include "encoder.hpp"
 #include "estimator.hpp"
 #include "graph.hpp"
-
 #include <algorithm>
 #include <numeric>
 #include <random>
 #include <vector>
-
 #include <omp.h>
 
 namespace evtq::rcgr {
@@ -25,8 +23,7 @@ inline GPDCalibration fit_gpd(const std::vector<float>& sorted_ratios) {
     float u = sorted_ratios[exc_start];
     size_t n_exc = m - exc_start;
 
-    double b0 = 0.0, b1 = 0.0;
-    double nm1 = static_cast<double>(n_exc - 1);
+    double b0 = 0.0, b1 = 0.0, nm1 = static_cast<double>(n_exc - 1);
     for (size_t i = 0; i < n_exc; ++i) {
         double x = static_cast<double>(sorted_ratios[exc_start + i] - u);
         b0 += x;
@@ -38,7 +35,6 @@ inline GPDCalibration fit_gpd(const std::vector<float>& sorted_ratios) {
     double d = b0 - 2.0 * b1;
     float xi = (d > 0.0) ? std::max(-1.0f, static_cast<float>(2.0 - b0 / d)) : -1.0f;
     float sigma = static_cast<float>(b0) * (1.0f - xi);
-
     float p_u = static_cast<float>(n_exc) / static_cast<float>(m);
     return {xi, sigma, u, p_u};
 }
@@ -46,7 +42,6 @@ inline GPDCalibration fit_gpd(const std::vector<float>& sorted_ratios) {
 template <size_t D>
 GPDCalibration calibrate(const RaBitQGraph<D>& graph, const NbitRaBitQEncoder<D>& encoder, size_t num_probes) {
     size_t n = graph.size();
-
     std::mt19937 rng(static_cast<uint32_t>(n));
     std::vector<size_t> indices(n);
     std::iota(indices.begin(), indices.end(), 0);
@@ -68,45 +63,37 @@ GPDCalibration calibrate(const RaBitQGraph<D>& graph, const NbitRaBitQEncoder<D>
 
     #pragma omp parallel
     {
-        int tid = omp_get_thread_num();
-        auto& local = per_thread[tid];
-
+        auto& local = per_thread[omp_get_thread_num()];
         estimator::NeighborEstimates<D> estimates;
 
         #pragma omp for schedule(guided)
         for (size_t si = 0; si < num_probes; ++si) {
-            NodeId qid = static_cast<NodeId>(indices[si]);
+            auto qid = static_cast<NodeId>(indices[si]);
             const float* qvec = padded_queries[si].data();
             float qnsq = dot_product_simd<D>(qvec, qvec);
-
             const auto& probe_nb = graph.get_neighbors(qid);
-            size_t num_pivots = probe_nb.size();
 
-            for (size_t pi = 0; pi < num_pivots; ++pi) {
+            for (size_t pi = 0; pi < probe_nb.size(); ++pi) {
                 NodeId pid = probe_nb.neighbor_ids[pi];
                 float dqp = graph.query_distance(qvec, qnsq, pid);
-
                 const auto& pnb = graph.get_neighbors(pid);
-                size_t nn = pnb.size();
                 estimator::estimate_neighbors<D>(encoded_queries[si], pnb, dqp, 0.0f, false, estimates);
 
-                for (size_t i = 0; i < nn; ++i) {
-                    NodeId nid = pnb.neighbor_ids[i];
-                    if (nid == qid) continue;
-                    float exact = graph.query_distance(qvec, qnsq, nid);
+                for (size_t i = 0; i < pnb.size(); ++i) {
+                    if (pnb.neighbor_ids[i] == qid) continue;
+                    float exact = graph.query_distance(qvec, qnsq, pnb.neighbor_ids[i]);
                     local.push_back(estimates.est_distances[i] / exact);
                 }
             }
         }
     }
 
+    std::vector<float> ratios;
     size_t total = 0;
     for (auto& v : per_thread) total += v.size();
-    std::vector<float> ratios;
     ratios.reserve(total);
     for (auto& v : per_thread) ratios.insert(ratios.end(), v.begin(), v.end());
     std::sort(ratios.begin(), ratios.end());
-
     return fit_gpd(ratios);
 }
 
