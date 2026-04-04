@@ -27,7 +27,7 @@ inline GPDCalibration fit_gpd(const std::vector<float>& sorted_ratios) {
     for (size_t i = 0; i < n_exc; ++i) {
         double x = static_cast<double>(sorted_ratios[exc_start + i] - u);
         b0 += x;
-        b1 += x * static_cast<double>(i) / nm1;
+        b1 += x * static_cast<double>(nm1 - static_cast<double>(i)) / nm1;
     }
     b0 /= static_cast<double>(n_exc);
     b1 /= static_cast<double>(n_exc);
@@ -82,7 +82,8 @@ GPDCalibration calibrate(const RaBitQGraph<D>& graph, const NbitRaBitQEncoder<D>
                 for (size_t i = 0; i < pnb.size(); ++i) {
                     if (pnb.neighbor_ids[i] == qid) continue;
                     float exact = graph.query_distance(qvec, qnsq, pnb.neighbor_ids[i]);
-                    local.push_back(estimates.est_distances[i] / exact);
+                    float est = estimates.est_distances[i];
+                    if (exact > 0.0f && est > 0.0f) local.push_back(est / exact);
                 }
             }
         }

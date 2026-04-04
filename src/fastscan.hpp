@@ -71,6 +71,22 @@ struct NbitFastScanNeighborBlock {
         if (slot >= count) count = static_cast<uint32_t>(slot + 1);
     }
 
+    void copy_neighbor_slot(size_t dst, size_t src) {
+        neighbor_ids[dst] = neighbor_ids[src];
+        centered_norm[dst] = centered_norm[src];
+        code_ip[dst] = code_ip[src];
+        code_parent_ip[dst] = code_parent_ip[src];
+        popcounts[dst] = popcounts[src];
+        msb2_popcounts[dst] = msb2_popcounts[src];
+        weighted_popcounts[dst] = weighted_popcounts[src];
+        size_t dst_batch = dst / 32, dst_idx = dst % 32;
+        size_t src_batch = src / 32, src_idx = src % 32;
+        for (size_t b = 0; b < BIT_WIDTH; ++b)
+            for (size_t sp = 0; sp < FastScanCodeBlock<D>::NUM_SUB_PAIRS; ++sp)
+                code_blocks[dst_batch].planes[b].packed[sp][dst_idx] = code_blocks[src_batch].planes[b].packed[sp][src_idx];
+        if (dst >= count) count = static_cast<uint32_t>(dst + 1);
+    }
+
     size_t size() const { return count; }
 };
 

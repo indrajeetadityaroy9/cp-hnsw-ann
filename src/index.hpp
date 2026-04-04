@@ -45,7 +45,7 @@ struct Index : IndexBase {
     }
 
     void finalize() override {
-        graph_refinement::vamana_build(graph_, encoder_);
+        graph_refinement::rnn_descent_build(graph_, encoder_);
         size_t num_probes = static_cast<size_t>(std::ceil(std::sqrt(static_cast<double>(graph_.size()))));
         calibration_ = rcgr::calibrate<D>(graph_, encoder_, num_probes);
     }

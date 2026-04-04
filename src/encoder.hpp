@@ -151,6 +151,7 @@ struct NbitRaBitQEncoder {
         result_code.clear();
         alignas(SIMD_ALIGNMENT) float diff[D];
         float cn = subtract_and_normalize(neighbor_vec, parent_vec, diff);
+        if (cn == 0.0f) return {std::move(result_code), {0.0f, inv_sqrt_d_, 0.0f}};
         alignas(SIMD_ALIGNMENT) float rotated[D];
         rotate_and_normalize(diff, rotated);
         float code_parent_ip = 0.0f;
